@@ -18,6 +18,7 @@ def read_pdf(
     flavor="lattice",
     suppress_stdout=False,
     parallel=False,
+    workers=None,
     layout_kwargs=None,
     debug=False,
     **kwargs,
@@ -135,6 +136,7 @@ def read_pdf(
             flavor=flavor,
             suppress_stdout=suppress_stdout,
             parallel=parallel,
+            workers=workers,
             layout_kwargs=layout_kwargs,
             **kwargs,
         )
