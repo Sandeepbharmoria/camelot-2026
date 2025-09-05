@@ -63,6 +63,7 @@ class PDFHandler:
         pages="1",
         password=None,
         debug=False,
+        respect_permissions=False
     ):
         self.debug = debug
         if is_url(filepath):
@@ -77,6 +78,7 @@ class PDFHandler:
         else:
             self.password = password
         self.pages = self._get_pages(pages)
+        self.respect_permissions = bool(respect_permissions)
 
     def _get_pages(self, pages):
         """Convert pages string to list of integers.
@@ -157,8 +159,46 @@ class PDFHandler:
 
         """
         infile = PdfReader(filepath, strict=False)
-        if infile.is_encrypted:
-            infile.decrypt(self.password)
+        # Respect user permissions before splitting (deny if extraction not allowed)
+        if getattr(infile, "is_encrypted", False):
+            if self.respect_permissions:
+                allowed = False
+
+                # Try modern bitmask first
+                try:
+                    from pypdf.constants import UserAccessPermissions as UAP  # type: ignore
+                except Exception:
+                    UAP = None  # type: ignore
+
+                try:
+                    uap = getattr(infile, "user_access_permissions", None)
+                    if (uap is not None) and (UAP is not None):
+                        if (uap & getattr(UAP, "EXTRACT", 0)) or (uap & getattr(UAP, "EXTRACT_TEXT_AND_GRAPHICS", 0)):
+                            allowed = True
+                except Exception:
+                    pass
+
+                # Fallback via decode_permissions on encryption dict
+                if not allowed:
+                    try:
+                        enc = getattr(infile, "_encryption", None)
+                        if (enc is not None) and hasattr(infile, "decode_permissions"):
+                            perms = infile.decode_permissions(enc.P)
+                            allowed = bool(perms.get("extract") or perms.get("extract_text_and_graphics"))
+                    except Exception:
+                        pass
+
+                if not allowed:
+                    raise PermissionError(
+                        "PDF forbids text/graphics extraction. "
+                        "Provide a password with sufficient rights or call read_pdf(..., respect_permissions=False)."
+                    )
+
+            # Either permissions allowed or override requested -> decrypt (if password provided)
+            infile.decrypt(self.password)  # noqa: S105
+
+
+            
         fpath = os.path.join(temp, f"page-{page}.pdf")
         froot, fext = os.path.splitext(fpath)
         p = infile.pages[page - 1]
