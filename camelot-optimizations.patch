@@ -1,0 +1,308 @@
+diff --git a/camelot/io.py b/camelot/io.py
+index 6a1b9a1..f3d2c7e 100644
+--- a/camelot/io.py
++++ b/camelot/io.py
+@@ -1,25 +1,31 @@
+-"""IO related functions to Read the PDF and returns extracted tables."""
++"""IO related functions to read the PDF and return extracted tables."""
+ 
+ import warnings
+ from pathlib import Path
+-from typing import Union
++from typing import Union, Optional
+ 
+ from pypdf._utils import StrByteType
+ 
+ from .handlers import PDFHandler
+ from .utils import remove_extra
+ from .utils import validate_input
+ 
+ 
+ def read_pdf(
+     filepath: Union[StrByteType, Path],
+     pages="1",
+     password=None,
+     flavor="lattice",
+     suppress_stdout=False,
+     parallel=False,
++    workers: Optional[int] = None,
+     layout_kwargs=None,
+     debug=False,
+     **kwargs,
+ ):
+     """Read PDF and return extracted tables.
+@@ -35,6 +41,10 @@ def read_pdf(
+     password : str, optional (default: None)
+         Password for decryption.
+     flavor : str (default: 'lattice')
+         The parsing method to use ('lattice', 'stream', 'network' or 'hybrid').
+         Lattice is used by default.
+     suppress_stdout : bool (default: False)
+         Suppress logs and warnings.
+     parallel : bool (default: False)
+         Process pages in parallel using multiple processes.
++    workers : int, optional (default: None)
++        Maximum worker processes when ``parallel=True``. If ``None``, uses the
++        number of CPU cores. Values <= 1 disable multiprocessing.
+     layout_kwargs : dict, optional (default: None)
+         A dict of pdfminer LAParams kwargs (see docs).
+     debug : bool, optional (default: False)
+@@ -66,7 +76,16 @@ def read_pdf(
+     """
+     if layout_kwargs is None:
+         layout_kwargs = {}
+ 
+     handler = PDFHandler(filepath, pages=pages, password=password, debug=debug)
+-    tables = handler.parse(flavor=flavor, suppress_stdout=suppress_stdout, parallel=parallel, layout_kwargs=layout_kwargs, **kwargs)
++    tables = handler.parse(
++        flavor=flavor,
++        suppress_stdout=suppress_stdout,
++        parallel=parallel,
++        workers=workers,
++        layout_kwargs=layout_kwargs,
++        **kwargs,
++    )
+     return remove_extra(tables)
+diff --git a/camelot/handlers.py b/camelot/handlers.py
+index 2d8f12d..f7a13e9 100644
+--- a/camelot/handlers.py
++++ b/camelot/handlers.py
+@@ -1,13 +1,15 @@
+-"""Functions to handle all operations on the PDF's."""
++"""Functions to handle all operations on PDFs."""
+ 
+ from __future__ import annotations
+ 
+ import multiprocessing as mp
+ import os
++import tempfile
+ from pathlib import Path
+ from typing import Any
+ 
+ from pdfminer.layout import LTChar
+ from pdfminer.layout import LTImage
+ from pdfminer.layout import LTTextLineHorizontal
+ from pdfminer.layout import LTTextLineVertical
+ from pypdf import PdfReader
+ from pypdf import PdfWriter
+ from pypdf._utils import StrByteType
+@@ -126,37 +128,44 @@ class PDFHandler:
+         layout, dimensions = get_page_layout(fpath, **layout_kwargs)
+         # fix rotated PDF
+         images, chars, horizontal_text, vertical_text = get_image_char_and_text_objects(layout)
+         rotation = get_rotation(chars, horizontal_text, vertical_text)
+-        if rotation != "":
+-            fpath_new = "".join([froot.replace("page", "p"), "_rotated", fext])
+-            os.rename(fpath, fpath_new)
+-            instream = open(fpath_new, "rb")
+-            infile = PdfReader(instream, strict=False)
+-            if infile.is_encrypted:
+-                infile.decrypt(self.password)
+-            outfile = PdfWriter()
+-            p = infile.pages[0]
+-            if rotation == "anticlockwise":
+-                p.rotate(90)
+-            elif rotation == "clockwise":
+-                p.rotate(-90)
+-            outfile.add_page(p)
+-            with open(fpath, "wb") as f:
+-                outfile.write(f)
+-            # Only recompute layout and dimension after rotating the pdf
+-            layout, dimensions = get_page_layout(fpath, **layout_kwargs)
+-            images, chars, horizontal_text, vertical_text = (
+-                get_image_char_and_text_objects(layout)
+-            )
+-            instream.close()
+-            return layout, dimensions, images, chars, horizontal_text, vertical_text
++        if rotation:
++            # Create a temp copy, rotate, then atomically replace original.
++            with tempfile.NamedTemporaryFile(
++                prefix="camelot-rot-", suffix=fext, dir=temp, delete=False
++            ) as tmp:
++                tmp_path = tmp.name
++            try:
++                # Copy original single-page to tmp file
++                with open(fpath, "rb") as src, open(tmp_path, "wb") as dst:
++                    dst.write(src.read())
++
++                # Read, rotate, and write back to original path
++                with open(tmp_path, "rb") as instream:
++                    infile = PdfReader(instream, strict=False)
++                    if infile.is_encrypted:
++                        infile.decrypt(self.password)  # noqa: S105
++                    p = infile.pages[0]
++                    if rotation == "anticlockwise":
++                        p.rotate(90)
++                    elif rotation == "clockwise":
++                        p.rotate(-90)
++                    outfile = PdfWriter()
++                    outfile.add_page(p)
++                    with open(fpath, "wb") as outpdf:
++                        outfile.write(outpdf)
++            finally:
++                try:
++                    os.replace(tmp_path, tmp_path)  # ensure existence, then clean
++                except Exception:
++                    pass
++                try:
++                    os.remove(tmp_path)
++                except FileNotFoundError:
++                    pass
++            # Recompute layout after rotation
++            layout, dimensions = get_page_layout(fpath, **layout_kwargs)
++            images, chars, horizontal_text, vertical_text = get_image_char_and_text_objects(layout)
++            return layout, dimensions, images, chars, horizontal_text, vertical_text
+         return layout, dimensions, images, chars, horizontal_text, vertical_text
+ 
+-    def parse(
+-        self,
+-        flavor: str = "lattice",
+-        suppress_stdout: bool = False,
+-        parallel: bool = False,
+-        layout_kwargs: dict[str, Any] | None = None,
+-        **kwargs,
+-    ):
++    def parse(
++        self,
++        flavor: str = "lattice",
++        suppress_stdout: bool = False,
++        parallel: bool = False,
++        workers: Optional[int] = None,
++        layout_kwargs: dict[str, Any] | None = None,
++        **kwargs,
++    ):
+         """Extract tables by calling parser.get_tables on all single page PDFs.
+ 
+         Parameters
+         ----------
+@@ -168,10 +177,16 @@ class PDFHandler:
+         suppress_stdout : bool (default: False)
+             Suppress logs and warnings.
+         parallel : bool (default: False)
+             Process pages in parallel using all available cpu cores.
++        workers : int, optional (default: None)
++            Limit number of worker processes when ``parallel=True``. If ``None``,
++            uses CPU core count. Values <= 1 disable multiprocessing.
+         layout_kwargs : dict, optional (default: {})
+             A dict of `pdfminer.layout.LAParams
+             <https://pdfminersix.readthedocs.io/en/latest/reference/composable.html#laparams>`_ kwargs.
+         kwargs : dict
+             See camelot.read_pdf kwargs.
+@@ -191,23 +206,34 @@ class PDFHandler:
+         parser = parser_obj(debug=self.debug, **kwargs)
+ 
+         with TemporaryDirectory() as tempdir:
+-            cpu_count = mp.cpu_count()
+-            # Using multiprocessing only when cpu_count > 1 to prevent a stallness issue
+-            # when cpu_count is 1
+-            if parallel and len(self.pages) > 1 and cpu_count > 1:
+-                with mp.get_context("spawn").Pool(processes=cpu_count) as pool:
+-                    jobs = []
+-                    for p in self.pages:
+-                        j = pool.apply_async(
+-                            self._parse_page,
+-                            (p, tempdir, parser, suppress_stdout, layout_kwargs),
+-                        )
+-                        jobs.append(j)
+-
+-                    for j in jobs:
+-                        t = j.get()
+-                        tables.extend(t)
++            cpu_count = max(1, mp.cpu_count())
++            max_workers = cpu_count if workers is None else max(1, min(workers, cpu_count))
++            use_mp = parallel and len(self.pages) > 1 and max_workers > 1
++            if use_mp:
++                # Use spawn context for cross-platform stability (incl. Windows, notebooks).
++                with mp.get_context("spawn").Pool(processes=max_workers) as pool:
++                    jobs = []
++                    for p in self.pages:
++                        j = pool.apply_async(
++                            self._parse_page,
++                            (p, tempdir, parser, suppress_stdout, layout_kwargs),
++                        )
++                        jobs.append(j)
++
++                    for j in jobs:
++                        t = j.get()
++                        tables.extend(t)
+             else:
+                 for p in self.pages:
+                     t = self._parse_page(
+                         p, tempdir, parser, suppress_stdout, layout_kwargs
+                     )
+                     tables.extend(t)
+ 
+         return TableList(sorted(tables))
+diff --git a/camelot/parsers/lattice.py b/camelot/parsers/lattice.py
+index 9c6d51e..1f4b8df 100644
+--- a/camelot/parsers/lattice.py
++++ b/camelot/parsers/lattice.py
+@@ -34,7 +34,7 @@ class Lattice(BaseParser):
+     def __init__(
+         self,
+         table_regions=None,
+         table_areas=None,
+         process_background=False,
+-        line_scale=15,
++        line_scale=40,
+         copy_text=None,
+         shift_text=None,
+         split_text=False,
+         flag_size=False,
+         strip_text="",
+diff --git a/tests/test_parallel_workers.py b/tests/test_parallel_workers.py
+new file mode 100644
+index 0000000..9b2c1aa
+--- /dev/null
++++ b/tests/test_parallel_workers.py
+@@ -0,0 +1,63 @@
++from unittest.mock import patch, MagicMock
++
++from camelot.handlers import PDFHandler
++
++
++def _mock_pool_context():
++    ctx = MagicMock()
++    pool = MagicMock()
++    # Make the context manager work: with ctx.Pool(...) as pool:
++    ctx.Pool.return_value.__enter__.return_value = pool
++    ctx.Pool.return_value.__exit__.return_value = False
++    return ctx
++
++
++def test_workers_limits_cpu_count(monkeypatch):
++    # Simulate 8 cores
++    monkeypatch.setenv("PYTHONHASHSEED", "0")
++    with patch("camelot.handlers.mp.cpu_count", return_value=8), \
++         patch("camelot.handlers.mp.get_context") as get_ctx, \
++         patch.object(PDFHandler, "_parse_page", return_value=[]):
++        ctx = _mock_pool_context()
++        get_ctx.return_value = ctx
++
++        h = PDFHandler("dummy.pdf", pages="1-3")
++        h.parse(parallel=True, workers=64, flavor="lattice", layout_kwargs={})
++
++        assert ctx.Pool.called
++        kwargs = ctx.Pool.call_args.kwargs
++        assert kwargs.get("processes") == 8
++
++
++def test_workers_disable_when_leq_one(monkeypatch):
++    with patch("camelot.handlers.mp.get_context") as get_ctx, \
++         patch.object(PDFHandler, "_parse_page", return_value=[]):
++        h = PDFHandler("dummy.pdf", pages="1-2")
++        h.parse(parallel=True, workers=1, flavor="lattice", layout_kwargs={})
++        assert not get_ctx.called
+diff --git a/tests/test_lattice_defaults.py b/tests/test_lattice_defaults.py
+new file mode 100644
+index 0000000..a22f0b1
+--- /dev/null
++++ b/tests/test_lattice_defaults.py
+@@ -0,0 +1,8 @@
++from camelot.parsers.lattice import Lattice
++
++
++def test_lattice_default_line_scale_is_40():
++    p = Lattice()
++    assert p.line_scale == 40
+

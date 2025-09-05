@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -171,36 +172,42 @@ class PDFHandler:
             layout
         )
         rotation = get_rotation(chars, horizontal_text, vertical_text)
-        if rotation != "":
-            fpath_new = "".join([froot.replace("page", "p"), "_rotated", fext])
-            os.rename(fpath, fpath_new)
-            instream = open(fpath_new, "rb")
-            infile = PdfReader(instream, strict=False)
-            if infile.is_encrypted:
-                infile.decrypt(self.password)
-            outfile = PdfWriter()
-            p = infile.pages[0]
-            if rotation == "anticlockwise":
-                p.rotate(90)
-            elif rotation == "clockwise":
-                p.rotate(-90)
-            outfile.add_page(p)
-            with open(fpath, "wb") as f:
-                outfile.write(f)
-            # Only recompute layout and dimension after rotating the pdf
+        if rotation:
+            # Windows-friendly: use a temp file, then rewrite original once.
+            with tempfile.NamedTemporaryFile(prefix="camelot-rot-", suffix=fext, dir=temp, delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                with open(fpath, "rb") as src, open(tmp_path, "wb") as dst:
+                    dst.write(src.read())
+                with open(tmp_path, "rb") as instream:
+                    infile = PdfReader(instream, strict=False)
+                    if infile.is_encrypted:
+                        infile.decrypt(self.password)
+                    page0 = infile.pages[0]
+                    if rotation == "anticlockwise":
+                        page0.rotate(90)
+                    elif rotation == "clockwise":
+                        page0.rotate(-90)
+                    out = PdfWriter()
+                    out.add_page(page0)
+                    with open(fpath, "wb") as outpdf:
+                        out.write(outpdf)
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except FileNotFoundError:
+                    pass
+            # Recompute layout after rotation
             layout, dimensions = get_page_layout(fpath, **layout_kwargs)
-            images, chars, horizontal_text, vertical_text = (
-                get_image_char_and_text_objects(layout)
-            )
-            instream.close()
+            images, chars, horizontal_text, vertical_text = get_image_char_and_text_objects(layout)
             return layout, dimensions, images, chars, horizontal_text, vertical_text
-        return layout, dimensions, images, chars, horizontal_text, vertical_text
 
     def parse(
         self,
         flavor: str = "lattice",
         suppress_stdout: bool = False,
         parallel: bool = False,
+        workers: int | None = None,
         layout_kwargs: dict[str, Any] | None = None,
         **kwargs,
     ):
@@ -236,11 +243,12 @@ class PDFHandler:
         parser = parser_obj(debug=self.debug, **kwargs)
 
         with TemporaryDirectory() as tempdir:
-            cpu_count = mp.cpu_count()
-            # Using multiprocessing only when cpu_count > 1 to prevent a stallness issue
-            # when cpu_count is 1
-            if parallel and len(self.pages) > 1 and cpu_count > 1:
-                with mp.get_context("spawn").Pool(processes=cpu_count) as pool:
+            cpu_count = max(1, mp.cpu_count())
+            max_workers = cpu_count if workers is None else max(1, min(int(workers), cpu_count))
+            use_mp = parallel and len(self.pages) > 1 and max_workers > 1
+            if use_mp:
+                # cross-platform stable multiprocessing
+                with mp.get_context("spawn").Pool(processes=max_workers) as pool:
                     jobs = []
                     for p in self.pages:
                         j = pool.apply_async(
@@ -258,8 +266,6 @@ class PDFHandler:
                         p, tempdir, parser, suppress_stdout, layout_kwargs
                     )
                     tables.extend(t)
-
-        return TableList(sorted(tables))
 
     def _parse_page(
         self, page: int, tempdir: str, parser, suppress_stdout: bool, layout_kwargs
