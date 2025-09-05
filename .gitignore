@@ -54,3 +54,23 @@ dmypy.json
 
 # OSX Files
 .DS_Store
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.build/
+dist/
+
+# Envs
+.venv/
+.env/
+venv/
+
+# OS/editor
+.DS_Store
+*.swp
+*.swo
+
+# local patches
+*.patch
+patch-*.diff
