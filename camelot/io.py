@@ -10,19 +10,21 @@ from .handlers import PDFHandler
 from .utils import remove_extra
 from .utils import validate_input
 
-
 def read_pdf(
     filepath: Union[StrByteType, Path],
-    pages="1",
-    password=None,
-    flavor="lattice",
-    suppress_stdout=False,
-    parallel=False,
-    workers=None,
-    layout_kwargs=None,
-    debug=False,
+    pages: str = "1",
+    password: str | None = None,
+    flavor: str = "lattice",
+    suppress_stdout: bool = False,
+    parallel: bool = False,
+    workers: int | None = None,
+    layout_kwargs: dict | None = None,
+    debug: bool = False,
+    respect_permissions: bool = True,
     **kwargs,
 ):
+
+
     """Read PDF and return extracted tables.
 
     Note: kwargs annotated with ^ can only be used with flavor='stream' or flavor='network'
@@ -130,8 +132,7 @@ def read_pdf(
             warnings.simplefilter("ignore")
 
         validate_input(kwargs, flavor=flavor)
-        p = PDFHandler(filepath, pages=pages, password=password, debug=debug)
-        kwargs = remove_extra(kwargs, flavor=flavor)
+        p = PDFHandler(filepath, pages=pages, password=password, debug=debug, respect_permissions=respect_permissions)
         tables = p.parse(
             flavor=flavor,
             suppress_stdout=suppress_stdout,

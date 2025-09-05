@@ -34,7 +34,7 @@ class Lattice(BaseParser):
         in PDF coordinate space.
     process_background : bool, optional (default: False)
         Process background lines.
-    line_scale : int, optional (default: 15)
+    line_scale : int, optional (default: 40)
         Line size scaling factor. The larger the value the smaller
         the detected lines. Making it very large will lead to text
         being detected as lines.
@@ -59,7 +59,7 @@ class Lattice(BaseParser):
     joint_tol : int, optional (default: 2)
         Tolerance parameter used to decide whether the detected lines
         and points lie close to each other.
-    threshold_blocksize : int, optional (default: 15)
+    threshold_blocksize : int, optional (default: 40)
         Size of a pixel neighborhood that is used to calculate a
         threshold value for the pixel: 3, 5, 7, and so on.
 

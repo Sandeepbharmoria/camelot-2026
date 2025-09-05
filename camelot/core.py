@@ -31,7 +31,7 @@ from .utils import get_textline_coords
 
 # minimum number of vertical textline intersections for a textedge
 # to be considered valid
-TEXTEDGE_REQUIRED_ELEMENTS = 4
+TEXTEDGE_REQUIRED_ELEMENTS = 2
 # padding added to table area on the left, right and bottom
 TABLE_AREA_PADDING = 10
 

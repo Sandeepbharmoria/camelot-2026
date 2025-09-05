@@ -219,19 +219,34 @@ class TemporaryDirectory:
         atexit.register(shutil.rmtree, self.name)
         return self.name
 
-    def __exit__(self, exc_type, exc_value, traceback):
-        """Called when the client exits.
+    def __exit__(self, exc_type, exc, tb):
+        import stat, time, shutil, os
+        def _onerror(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+            except Exception:
+                pass
+            try:
+                func(path)
+            except Exception:
+                pass
+        # retry a few times to dodge PermissionError if handles linger
+        for i in range(5):
+            try:
+                shutil.rmtree(self.name, onerror=_onerror)
+                break
+            except PermissionError:
+                time.sleep(0.2 * (i + 1))
+            except Exception:
+                # swallow if ignore flag is set in your class; otherwise re-raise
+                try:
+                    if not getattr(self, "_ignore", True):
+                        raise
+                except Exception:
+                    pass
+                break
+        return False
 
-        Parameters
-        ----------
-        exc_type : [type]
-            [description]
-        exc_value : [type]
-            [description]
-        traceback : [type]
-            [description]
-        """
-        pass
 
 
 def build_file_path_in_temp_dir(filename, extension=None):

@@ -75,6 +75,17 @@ class Stream(TextBaseParser):
             column_tol=column_tol,
         )
         self.textedges = []
+        # Per-instance threshold (fallback to the core default)
+        from .. import core as _core
+        if textedge_min_intersections is not None:
+            self._textedge_required = max(1, int(textedge_min_intersections))
+        else:
+            self._textedge_required = int(getattr(_core, "self._textedge_required", 2))
+
+    def prepare_page_parse(self, filename, layout, dimensions, page_idx,images, horizontal_text, vertical_text, layout_kwargs=None):
+        super().prepare_page_parse(filename, layout, dimensions, page_idx,images, horizontal_text, vertical_text, layout_kwargs=layout_kwargs)
+         # page-scoped cache
+        self.textedges.clear()
 
     def _nurminen_table_detection(self, textlines):
         """Anssi Nurminen's Table detection algorithm.
@@ -108,6 +119,11 @@ class Stream(TextBaseParser):
         table._textedges = self.textedges
 
     def _generate_table_bbox(self):
+        # ensure fresh textedges for each page
+        if hasattr(self, "textedges"):
+            self.textedges.clear()
+        else:
+            self.textedges = [] 
         if self.table_areas is None:
             hor_text = self.horizontal_text
             if self.table_regions is not None:
