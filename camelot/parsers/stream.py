@@ -59,6 +59,7 @@ class Stream(TextBaseParser):
         edge_tol=50,
         row_tol=2,
         column_tol=0,
+        textedge_min_intersections=None,
         **kwargs,
     ):
         super().__init__(
@@ -78,9 +79,9 @@ class Stream(TextBaseParser):
         # Per-instance threshold (fallback to the core default)
         from .. import core as _core
         if textedge_min_intersections is not None:
-            self._textedge_required = max(1, int(textedge_min_intersections))
+            TEXTEDGE_REQUIRED_ELEMENTS = max(1, int(textedge_min_intersections))
         else:
-            self._textedge_required = int(getattr(_core, "self._textedge_required", 2))
+            TEXTEDGE_REQUIRED_ELEMENTS = int(getattr(_core, "TEXTEDGE_REQUIRED_ELEMENTS", 2))
 
     def prepare_page_parse(self, filename, layout, dimensions, page_idx,images, horizontal_text, vertical_text, layout_kwargs=None):
         super().prepare_page_parse(filename, layout, dimensions, page_idx,images, horizontal_text, vertical_text, layout_kwargs=layout_kwargs)

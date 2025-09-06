@@ -242,7 +242,7 @@ class BaseParser:
             cols, rows, v_s, h_s = self._generate_columns_and_rows(bbox, user_cols)
             table = self._generate_table(table_idx, bbox, cols, rows, v_s=v_s, h_s=h_s)
             _tables.append(table)
-
+            self._drop_intermediates()
         return _tables
 
     def record_parse_metadata(self, table):
@@ -313,6 +313,15 @@ class TextBaseParser(BaseParser):
         self.edge_tol = edge_tol
         self.row_tol = row_tol
         self.column_tol = column_tol
+        def _drop_intermediates(self):
+            # Don’t drop anything if debugging or explicitly retaining
+            if self.retain_intermediate_images or getattr(self, "debug", False):
+                return
+            for attr in ("pdf_image", "threshold", "horizontal", "vertical", "joints", "image", "thresholded"):
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+        self._drop_intermediates = _drop_intermediates
+
 
     @staticmethod
     def _group_rows(text, row_tol=2):

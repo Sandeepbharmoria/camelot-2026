@@ -282,6 +282,45 @@ class PDFHandler:
         parser_obj = PARSERS[flavor]
         parser = parser_obj(debug=self.debug, **kwargs)
 
+        if flavor != "hybrid":
+            parser.prepare_page_parse(page_path, layout, dimensions, page, images,
+                                    horizontal_text, vertical_text,
+                                    layout_kwargs=layout_kwargs)
+            return parser.extract_tables()
+
+        # HYBRID path: try lattice, then fallback to stream if needed
+        # 1) Lattice attempt
+        lattice = PARSERS["lattice"](debug=self.debug, **{k: v for k, v in kwargs.items() if k != "flavor"})
+        lattice.prepare_page_parse(page_path, layout, dimensions, page, images,
+                                horizontal_text, vertical_text,
+                                layout_kwargs=layout_kwargs)
+        lattice_tables = lattice.extract_tables()
+
+        def _looks_empty(ts):
+            if not ts:
+                return True
+            # heuristic: sometimes lattice returns 1x1 or degenerate tables
+            for t in ts:
+                shape = getattr(t, "shape", None)
+                if shape and (shape[0] > 1 or shape[1] > 1):
+                    return False
+            return True
+
+        if not _looks_empty(lattice_tables):
+            return lattice_tables
+
+        # 2) Stream fallback (more permissive)
+        stream_kwargs = kwargs.copy()
+        # helpful defaults for sparse/single-row tables; caller can override:
+        stream_kwargs.setdefault("textedge_min_intersections", 2)
+
+        stream = PARSERS["stream"](debug=self.debug, **{k: v for k, v in stream_kwargs.items() if k != "flavor"})
+        stream.prepare_page_parse(page_path, layout, dimensions, page, images,
+                                horizontal_text, vertical_text,
+                                layout_kwargs=layout_kwargs)
+        return stream.extract_tables()
+
+
         with TemporaryDirectory() as tempdir:
             cpu_count = max(1, mp.cpu_count())
             max_workers = cpu_count if workers is None else max(1, min(int(workers), cpu_count))
