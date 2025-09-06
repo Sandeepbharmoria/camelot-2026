@@ -42,9 +42,10 @@ class ImageConversionBackend:
         """
         self.backend: ConversionBackend = self.get_backend(backend)
         self.use_fallback: bool = use_fallback
-        self.fallbacks: List[str] = list(
-            filter(lambda x: isinstance(backend, str) and x != backend, BACKENDS.keys())
-        )
+        if isinstance(backend, str):
+            self.fallbacks = [k for k in BACKENDS.keys() if k != backend]
+        else:
+            self.fallbacks = list(BACKENDS.keys())
 
     def get_backend(self, backend):
         """Retrieve the specified backend for processing.
@@ -57,7 +58,7 @@ class ImageConversionBackend:
         ----------
         backend : str or object
             The backend to retrieve. This can be:
-                - A string ('poppler' or 'ghostscript') corresponding to a pre-defined backend.
+                - A string ('pdfium', 'poppler', or 'ghostscript') corresponding to a pre-defined backend.
                 - An object that must implement a 'convert' method.
 
         Returns
@@ -104,7 +105,7 @@ class ImageConversionBackend:
 
             return backend
 
-    def convert(self, pdf_path: str, png_path: str) -> None:
+    def convert(self, pdf_path: str, png_path: str, resolution: int = 300) -> None:
         """Convert PDF to png_path.
 
         Parameters
@@ -122,13 +123,13 @@ class ImageConversionBackend:
             [description]
         """
         try:
-            self.backend.convert(pdf_path, png_path)
+            self.backend.convert(pdf_path, png_path, resolution=resolution)
         except Exception as f:
             if self.use_fallback:
                 for fallback in self.fallbacks:
                     try:
                         converter = BACKENDS[fallback]()
-                        converter.convert(pdf_path, png_path)
+                        converter.convert(pdf_path, png_path, resolution=resolution)
                     except Exception as e:
                         msg = f"Image conversion failed with image conversion backend {fallback!r}\n error: {e}"
                         raise ImageConversionError(msg) from e

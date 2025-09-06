@@ -45,13 +45,12 @@ class PopplerBackend(ConversionBackend):
                 "pdftopng is not installed. You can install it using the 'pip install pdftopng' command."
             )
 
-        pdftopng_command = [pdftopng_executable, pdf_path, png_path]
+        pdftopng_command = [pdftopng_executable, f"-r{resolution}", pdf_path, png_path]
 
         try:
             subprocess.check_output(
-                " ".join(pdftopng_command),
+                pdftopng_command,
                 stderr=subprocess.STDOUT,
-                shell=False,  # noqa
             )
         except subprocess.CalledProcessError as e:
             raise ValueError(e.output) from e
