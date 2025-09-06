@@ -223,7 +223,7 @@ class Lattice(BaseParser):
     def _generate_table_bbox(self) -> None:
         """Render page to image, detect lines/joints, build table bounding boxes + anchors."""
         self.image_path = build_file_path_in_temp_dir(os.path.basename(self.filename), ".png")
-        self.icb.convert(self.filename, self.image_path)
+        self.icb.convert(self.filename, self.image_path, resolution=self.resolution)
 
         # rasterize + threshold
         self.pdf_image, self.threshold = adaptive_threshold(

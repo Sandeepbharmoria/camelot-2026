@@ -134,7 +134,7 @@ class Stream(TextBaseParser):
                     region_text = text_in_bbox(
                         bbox_from_str(region_str), self.horizontal_text
                     )
-                hor_text.extend(region_text)
+                    hor_text.extend(region_text)
             # find tables based on nurminen's detection algorithm
             table_bbox_parses = self._nurminen_table_detection(hor_text)
         else:

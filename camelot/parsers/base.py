@@ -315,7 +315,7 @@ class TextBaseParser(BaseParser):
         self.column_tol = column_tol
         def _drop_intermediates(self):
             # Don’t drop anything if debugging or explicitly retaining
-            if self.retain_intermediate_images or getattr(self, "debug", False):
+            if getattr(self, "retain_intermediate_images", False) or getattr(self, "debug", False):
                 return
             for attr in ("pdf_image", "threshold", "horizontal", "vertical", "joints", "image", "thresholded"):
                 if hasattr(self, attr):
