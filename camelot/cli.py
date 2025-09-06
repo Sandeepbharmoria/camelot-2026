@@ -4,7 +4,6 @@ import logging
 
 import click
 
-
 try:
     import matplotlib.pyplot as plt
 except ImportError:
@@ -17,7 +16,6 @@ from typing import Optional
 
 from . import plot
 from . import read_pdf
-
 
 logger = logging.getLogger("camelot")
 logger.setLevel(logging.INFO)
@@ -56,16 +54,27 @@ pass_config = click.make_pass_decorator(Config)
     "-q", "--quiet", is_flag=False, default=False, help="Suppress logs and warnings."
 )
 @click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Max parallel workers (default: CPU cores).",
+)
+@click.option(
+    "--respect-permissions/--ignore-permissions",
+    default=True,
+    help="Respect PDF extraction permissions.",
+)
+@click.option(
     "-p",
     "--pages",
     default="1",
-    help="Comma-separated page numbers." " Example: 1,3,4 or 1,4-end or all.",
+    help="Comma-separated page numbers. Example: 1,3,4 or 1,4-end or all.",
 )
 @click.option(
     "--parallel",
     is_flag=True,
     default=False,
-    help="Read pdf pages in parallel using all CPU cores.",
+    help="Read pdf pages in parallel using all CPU cores (or --workers).",
 )
 @click.option("-pw", "--password", help="Password for decryption.")
 @click.option("-o", "--output", help="Output file path.")
@@ -86,13 +95,12 @@ pass_config = click.make_pass_decorator(Config)
     "-flag",
     "--flag_size",
     is_flag=True,
-    help="Flag text based on" " font size. Useful to detect super/subscripts.",
+    help="Flag text based on font size. Useful to detect super/subscripts.",
 )
 @click.option(
     "-strip",
     "--strip_text",
-    help="Characters that should be stripped from a string before"
-    " assigning it to a cell.",
+    help="Characters that should be stripped from a string before assigning it to a cell.",
 )
 @click.option(
     "-M",
@@ -111,20 +119,29 @@ def cli(ctx, *args, **kwargs):
 
 @cli.command("lattice")
 @click.option(
+    "--retain-intermediate-images/--no-retain-intermediate-images",
+    default=False,
+    help="Keep large intermediate images (uses more RAM).",
+)
+@click.option(
+    "--intersection-epsilon",
+    type=float,
+    default=0.5,
+    help="Tolerance (px) for lattice anchor merging/joints.",
+)
+@click.option(
     "-R",
     "--table_regions",
     default=[],
     multiple=True,
-    help="Page regions to analyze. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Page regions to analyze. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-T",
     "--table_areas",
     default=[],
     multiple=True,
-    help="Table areas to process. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Table areas to process. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-back", "--process_background", is_flag=True, help="Process background lines."
@@ -133,8 +150,7 @@ def cli(ctx, *args, **kwargs):
     "-scale",
     "--line_scale",
     default=40,
-    help="Line size scaling factor. The larger the value,"
-    " the smaller the detected lines.",
+    help="Line size scaling factor. The larger the value, the smaller the detected lines.",
 )
 @click.option(
     "-copy",
@@ -142,7 +158,7 @@ def cli(ctx, *args, **kwargs):
     default=[],
     type=click.Choice(["h", "v"]),
     multiple=True,
-    help="Direction in which text in a spanning cell" " will be copied over.",
+    help="Direction in which text in a spanning cell will be copied over.",
 )
 @click.option(
     "-shift",
@@ -156,36 +172,31 @@ def cli(ctx, *args, **kwargs):
     "-l",
     "--line_tol",
     default=2,
-    help="Tolerance parameter used to merge close vertical" " and horizontal lines.",
+    help="Tolerance used to merge close vertical and horizontal lines.",
 )
 @click.option(
     "-j",
     "--joint_tol",
     default=2,
-    help="Tolerance parameter used to decide whether"
-    " the detected lines and points lie close to each other.",
+    help="Tolerance used to decide whether detected lines and points lie close to each other.",
 )
 @click.option(
     "-block",
     "--threshold_blocksize",
     default=15,
-    help="For adaptive thresholding, size of a pixel"
-    " neighborhood that is used to calculate a threshold value for"
-    " the pixel. Example: 3, 5, 7, and so on.",
+    help="Adaptive thresholding: neighborhood size (odd int).",
 )
 @click.option(
     "-const",
     "--threshold_constant",
     default=-2,
-    help="For adaptive thresholding, constant subtracted"
-    " from the mean or weighted mean. Normally, it is positive but"
-    " may be zero or negative as well.",
+    help="Adaptive thresholding: constant subtracted from mean/weighted mean.",
 )
 @click.option(
     "-I",
     "--iterations",
     default=0,
-    help="Number of times for erosion/dilation will be applied.",
+    help="Number of times erosion/dilation will be applied.",
 )
 @click.option(
     "-res",
@@ -213,6 +224,17 @@ def lattice(c, *args, **kwargs):
     filepath = kwargs.pop("filepath")
     kwargs.update(conf)
 
+    # Build PDFMiner layout kwargs from group-level margins if present
+    margins = conf.pop("margins", None)
+    if margins is None:
+        layout_kwargs = {}
+    else:
+        layout_kwargs = {
+            "char_margin": margins[0],
+            "line_margin": margins[1],
+            "word_margin": margins[2],
+        }
+
     table_regions = list(kwargs["table_regions"])
     kwargs["table_regions"] = None if not table_regions else table_regions
     table_areas = list(kwargs["table_areas"])
@@ -231,7 +253,12 @@ def lattice(c, *args, **kwargs):
             raise click.UsageError("Please specify output file format using --format")
 
     tables = read_pdf(
-        filepath, pages=pages, flavor="lattice", suppress_stdout=quiet, **kwargs
+        filepath,
+        pages=pages,
+        flavor="lattice",
+        suppress_stdout=quiet,
+        layout_kwargs=layout_kwargs,
+        **kwargs,
     )
     click.echo(f"Found {tables.n} tables")
     if plot_type is not None:
@@ -248,16 +275,14 @@ def lattice(c, *args, **kwargs):
     "--table_regions",
     default=[],
     multiple=True,
-    help="Page regions to analyze. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Page regions to analyze. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-T",
     "--table_areas",
     default=[],
     multiple=True,
-    help="Table areas to process. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Table areas to process. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-C",
@@ -270,20 +295,19 @@ def lattice(c, *args, **kwargs):
     "-e",
     "--edge_tol",
     default=50,
-    help="Tolerance parameter" " for extending textedges vertically.",
+    help="Tolerance parameter for extending textedges vertically.",
 )
 @click.option(
     "-r",
     "--row_tol",
     default=2,
-    help="Tolerance parameter" " used to combine text vertically, to generate rows.",
+    help="Tolerance parameter used to combine text vertically, to generate rows.",
 )
 @click.option(
     "-c",
     "--column_tol",
     default=0,
-    help="Tolerance parameter"
-    " used to combine text horizontally, to generate columns.",
+    help="Tolerance parameter used to combine text horizontally, to generate columns.",
 )
 @click.option(
     "-plot",
@@ -351,20 +375,29 @@ def stream(c, *args, **kwargs):
 
 @cli.command("hybrid")
 @click.option(
+    "--retain-intermediate-images/--no-retain-intermediate-images",
+    default=False,
+    help="Keep large intermediate images (uses more RAM).",
+)
+@click.option(
+    "--intersection-epsilon",
+    type=float,
+    default=0.5,
+    help="Tolerance (px) for lattice anchor merging/joints.",
+)
+@click.option(
     "-R",
     "--table_regions",
     default=[],
     multiple=True,
-    help="Page regions to analyze. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Page regions to analyze. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-T",
     "--table_areas",
     default=[],
     multiple=True,
-    help="Table areas to process. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Table areas to process. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-C",
@@ -377,20 +410,19 @@ def stream(c, *args, **kwargs):
     "-e",
     "--edge_tol",
     default=50,
-    help="Tolerance parameter" " for extending textedges vertically.",
+    help="Tolerance parameter for extending textedges vertically.",
 )
 @click.option(
     "-r",
     "--row_tol",
     default=2,
-    help="Tolerance parameter" " used to combine text vertically, to generate rows.",
+    help="Tolerance parameter used to combine text vertically, to generate rows.",
 )
 @click.option(
     "-c",
     "--column_tol",
     default=0,
-    help="Tolerance parameter"
-    " used to combine text horizontally, to generate columns.",
+    help="Tolerance parameter used to combine text horizontally, to generate columns.",
 )
 @click.option(
     "-plot",
@@ -412,6 +444,17 @@ def hybrid(c, *args, **kwargs):
     filepath = kwargs.pop("filepath")
     kwargs.update(conf)
 
+    # Convert margins to layout kwargs (used by stream fallback inside Hybrid)
+    margins = conf.pop("margins", None)
+    if margins is None:
+        layout_kwargs = {}
+    else:
+        layout_kwargs = {
+            "char_margin": margins[0],
+            "line_margin": margins[1],
+            "word_margin": margins[2],
+        }
+
     table_regions = list(kwargs["table_regions"])
     kwargs["table_regions"] = None if not table_regions else table_regions
     table_areas = list(kwargs["table_areas"])
@@ -429,7 +472,12 @@ def hybrid(c, *args, **kwargs):
             raise click.UsageError("Please specify output file format using --format")
 
     tables = read_pdf(
-        filepath, pages=pages, flavor="hybrid", suppress_stdout=quiet, **kwargs
+        filepath,
+        pages=pages,
+        flavor="hybrid",
+        suppress_stdout=quiet,
+        layout_kwargs=layout_kwargs,
+        **kwargs,
     )
     click.echo(f"Found {tables.n} tables")
     if plot_type is not None:
@@ -446,16 +494,14 @@ def hybrid(c, *args, **kwargs):
     "--table_regions",
     default=[],
     multiple=True,
-    help="Page regions to analyze. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Page regions to analyze. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-T",
     "--table_areas",
     default=[],
     multiple=True,
-    help="Table areas to process. Example: x1,y1,x2,y2"
-    " where x1, y1 -> left-top and x2, y2 -> right-bottom.",
+    help="Table areas to process. Example: x1,y1,x2,y2 where x1, y1 -> left-top and x2, y2 -> right-bottom.",
 )
 @click.option(
     "-C",
@@ -468,20 +514,19 @@ def hybrid(c, *args, **kwargs):
     "-e",
     "--edge_tol",
     default=50,
-    help="Tolerance parameter" " for extending textedges vertically.",
+    help="Tolerance parameter for extending textedges vertically.",
 )
 @click.option(
     "-r",
     "--row_tol",
     default=2,
-    help="Tolerance parameter" " used to combine text vertically, to generate rows.",
+    help="Tolerance parameter used to combine text vertically, to generate rows.",
 )
 @click.option(
     "-c",
     "--column_tol",
     default=0,
-    help="Tolerance parameter"
-    " used to combine text horizontally, to generate columns.",
+    help="Tolerance parameter used to combine text horizontally, to generate columns.",
 )
 @click.option(
     "-plot",
@@ -529,3 +574,4 @@ def network(c, *args, **kwargs):
             plt.show()
     else:
         tables.export(output, f=f, compress=compress)
+
