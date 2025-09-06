@@ -59,7 +59,7 @@ class Lattice(BaseParser):
     joint_tol : int, optional (default: 2)
         Tolerance parameter used to decide whether the detected lines
         and points lie close to each other.
-    threshold_blocksize : int, optional (default: 40)
+    threshold_blocksize : int, optional (default: 15)
         Size of a pixel neighborhood that is used to calculate a
         threshold value for the pixel: 3, 5, 7, and so on.
 
@@ -89,6 +89,7 @@ class Lattice(BaseParser):
         table_regions=None,
         table_areas=None,
         process_background=False,
+        retain_intermediate_images=False,
         line_scale=40,
         copy_text=None,
         shift_text=None,
@@ -102,7 +103,7 @@ class Lattice(BaseParser):
         iterations=0,
         resolution=300,
         use_fallback=True,
-        backend="pdfium",
+        backend="auto",
         **kwargs,
     ):
         super().__init__("lattice")
@@ -125,6 +126,30 @@ class Lattice(BaseParser):
         self.icb = ImageConversionBackend(use_fallback=use_fallback, backend=backend)
         self.image_path = None
         self.pdf_image = None
+        self.image = None
+        self.thresholded = None
+        self.horizontal = None
+        self.vertical = None
+        self.joints = None
+
+        def _maybe_store(name, value):
+            # only keep big arrays when explicitly requested or debugging
+            if self.retain_intermediate_images or getattr(self, "debug", False):
+                setattr(self, name, value)
+
+        # stash the helper for quick use
+        self._maybe_store = _maybe_store
+
+        def _drop_intermediates(self):
+            # Don’t drop anything if debugging or explicitly retaining
+            if self.retain_intermediate_images or getattr(self, "debug", False):
+                return
+            for attr in ("pdf_image", "threshold", "horizontal", "vertical", "joints", "image", "thresholded"):
+                if hasattr(self, attr):
+                    setattr(self, attr, None)
+        self._drop_intermediates = _drop_intermediates
+
+
 
     @staticmethod
     def _shift_index(
