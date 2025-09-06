@@ -63,7 +63,7 @@ class PDFHandler:
         pages="1",
         password=None,
         debug=False,
-        respect_permissions=False
+        respect_permissions=False,
     ):
         self.debug = debug
         if is_url(filepath):
@@ -173,7 +173,9 @@ class PDFHandler:
                 try:
                     uap = getattr(infile, "user_access_permissions", None)
                     if (uap is not None) and (UAP is not None):
-                        if (uap & getattr(UAP, "EXTRACT", 0)) or (uap & getattr(UAP, "EXTRACT_TEXT_AND_GRAPHICS", 0)):
+                        if (uap & getattr(UAP, "EXTRACT", 0)) or (
+                            uap & getattr(UAP, "EXTRACT_TEXT_AND_GRAPHICS", 0)
+                        ):
                             allowed = True
                 except Exception:
                     pass
@@ -184,7 +186,10 @@ class PDFHandler:
                         enc = getattr(infile, "_encryption", None)
                         if (enc is not None) and hasattr(infile, "decode_permissions"):
                             perms = infile.decode_permissions(enc.P)
-                            allowed = bool(perms.get("extract") or perms.get("extract_text_and_graphics"))
+                            allowed = bool(
+                                perms.get("extract")
+                                or perms.get("extract_text_and_graphics")
+                            )
                     except Exception:
                         pass
 
@@ -197,8 +202,6 @@ class PDFHandler:
             # Either permissions allowed or override requested -> decrypt (if password provided)
             infile.decrypt(self.password)  # noqa: S105
 
-
-            
         fpath = os.path.join(temp, f"page-{page}.pdf")
         froot, fext = os.path.splitext(fpath)
         p = infile.pages[page - 1]
@@ -214,7 +217,9 @@ class PDFHandler:
         rotation = get_rotation(chars, horizontal_text, vertical_text)
         if rotation:
             # Windows-friendly: use a temp file, then rewrite original once.
-            with tempfile.NamedTemporaryFile(prefix="camelot-rot-", suffix=fext, dir=temp, delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(
+                prefix="camelot-rot-", suffix=fext, dir=temp, delete=False
+            ) as tmp:
                 tmp_path = tmp.name
             try:
                 with open(fpath, "rb") as src, open(tmp_path, "wb") as dst:
@@ -239,7 +244,9 @@ class PDFHandler:
                     pass
             # Recompute layout after rotation
             layout, dimensions = get_page_layout(fpath, **layout_kwargs)
-            images, chars, horizontal_text, vertical_text = get_image_char_and_text_objects(layout)
+            images, chars, horizontal_text, vertical_text = (
+                get_image_char_and_text_objects(layout)
+            )
             return layout, dimensions, images, chars, horizontal_text, vertical_text
 
     def parse(
@@ -281,49 +288,13 @@ class PDFHandler:
         # parser = Lattice(**kwargs) if flavor == "lattice" else Stream(**kwargs)
         parser_obj = PARSERS[flavor]
         parser = parser_obj(debug=self.debug, **kwargs)
-
-        if flavor != "hybrid":
-            parser.prepare_page_parse(page_path, layout, dimensions, page, images,
-                                    horizontal_text, vertical_text,
-                                    layout_kwargs=layout_kwargs)
-            return parser.extract_tables()
-
-        # HYBRID path: try lattice, then fallback to stream if needed
-        # 1) Lattice attempt
-        lattice = PARSERS["lattice"](debug=self.debug, **{k: v for k, v in kwargs.items() if k != "flavor"})
-        lattice.prepare_page_parse(page_path, layout, dimensions, page, images,
-                                horizontal_text, vertical_text,
-                                layout_kwargs=layout_kwargs)
-        lattice_tables = lattice.extract_tables()
-
-        def _looks_empty(ts):
-            if not ts:
-                return True
-            # heuristic: sometimes lattice returns 1x1 or degenerate tables
-            for t in ts:
-                shape = getattr(t, "shape", None)
-                if shape and (shape[0] > 1 or shape[1] > 1):
-                    return False
-            return True
-
-        if not _looks_empty(lattice_tables):
-            return lattice_tables
-
-        # 2) Stream fallback (more permissive)
-        stream_kwargs = kwargs.copy()
-        # helpful defaults for sparse/single-row tables; caller can override:
-        stream_kwargs.setdefault("textedge_min_intersections", 2)
-
-        stream = PARSERS["stream"](debug=self.debug, **{k: v for k, v in stream_kwargs.items() if k != "flavor"})
-        stream.prepare_page_parse(page_path, layout, dimensions, page, images,
-                                horizontal_text, vertical_text,
-                                layout_kwargs=layout_kwargs)
-        return stream.extract_tables()
-
-
+        # Per-page parsing (and any hybrid behavior) is handled below in _parse_page.
+        # If flavor == "hybrid", the Hybrid parser implements lattice→stream fallback per page.
         with TemporaryDirectory() as tempdir:
             cpu_count = max(1, mp.cpu_count())
-            max_workers = cpu_count if workers is None else max(1, min(int(workers), cpu_count))
+            max_workers = (
+                cpu_count if workers is None else max(1, min(int(workers), cpu_count))
+            )
             use_mp = parallel and len(self.pages) > 1 and max_workers > 1
             if use_mp:
                 # cross-platform stable multiprocessing
