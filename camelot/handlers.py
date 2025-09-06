@@ -14,6 +14,7 @@ from pdfminer.layout import LTTextLineHorizontal
 from pdfminer.layout import LTTextLineVertical
 from pypdf import PdfReader
 from pypdf import PdfWriter
+from pypdf.errors import PdfReadError
 from pypdf._utils import StrByteType
 
 from .core import TableList
@@ -21,7 +22,7 @@ from .parsers import Hybrid
 from .parsers import Lattice
 from .parsers import Network
 from .parsers import Stream
-from .utils import TemporaryDirectory
+from tempfile import TemporaryDirectory
 from .utils import download_url
 from .utils import get_image_char_and_text_objects
 from .utils import get_page_layout
@@ -134,73 +135,22 @@ class PDFHandler:
         list[LTTextLineHorizontal],
         list[LTTextLineVertical],
     ]:
-        """Saves specified page from PDF into a temporary directory.
-
-        Parameters
-        ----------
-        filepath : str
-            Filepath or URL of the PDF file.
-        page : int
-            Page number.
-        temp : str
-            Tmp directory.
-
-
-        Returns
-        -------
-        layout : object
-
-        dimensions : tuple
-            The dimensions of the pdf page
-
-        filepath : str
-            The path of the single page PDF - either the original, or a
-            normalized version.
-
-        """
+        """Saves specified page from PDF into a temporary directory."""
         infile = PdfReader(filepath, strict=False)
-        # Respect user permissions before splitting (deny if extraction not allowed)
-        if getattr(infile, "is_encrypted", False):
-            if self.respect_permissions:
-                allowed = False
-
-                # Try modern bitmask first
-                try:
-                    from pypdf.constants import UserAccessPermissions as UAP  # type: ignore
-                except Exception:
-                    UAP = None  # type: ignore
-
-                try:
-                    uap = getattr(infile, "user_access_permissions", None)
-                    if (uap is not None) and (UAP is not None):
-                        if (uap & getattr(UAP, "EXTRACT", 0)) or (
-                            uap & getattr(UAP, "EXTRACT_TEXT_AND_GRAPHICS", 0)
-                        ):
-                            allowed = True
-                except Exception:
-                    pass
-
-                # Fallback via decode_permissions on encryption dict
-                if not allowed:
-                    try:
-                        enc = getattr(infile, "_encryption", None)
-                        if (enc is not None) and hasattr(infile, "decode_permissions"):
-                            perms = infile.decode_permissions(enc.P)
-                            allowed = bool(
-                                perms.get("extract")
-                                or perms.get("extract_text_and_graphics")
-                            )
-                    except Exception:
-                        pass
-
-                if not allowed:
+        if infile.is_encrypted:
+            try:
+                infile.decrypt(self.password)
+            except PdfReadError as e:
+                if "extraction for accessibility" in str(e) and self.respect_permissions:
                     raise PermissionError(
-                        "PDF forbids text/graphics extraction. "
-                        "Provide a password with sufficient rights or call read_pdf(..., respect_permissions=False)."
-                    )
-
-            # Either permissions allowed or override requested -> decrypt (if password provided)
-            infile.decrypt(self.password)  # noqa: S105
+                        "PDF forbids text/graphics extraction. To override, "
+                        "call read_pdf with respect_permissions=False."
+                    ) from e
+                elif self.password == "":
+                    raise PermissionError(
+                        "PDF is encrypted, please provide a password."
+                    ) from e
+                raise e
 
         fpath = os.path.join(temp, f"page-{page}.pdf")
         froot, fext = os.path.splitext(fpath)
@@ -210,6 +160,7 @@ class PDFHandler:
         with open(fpath, "wb") as f:
             outfile.write(f)
         layout, dimensions = get_page_layout(fpath, **layout_kwargs)
+
         # fix rotated PDF
         images, chars, horizontal_text, vertical_text = get_image_char_and_text_objects(
             layout
@@ -248,6 +199,12 @@ class PDFHandler:
                 get_image_char_and_text_objects(layout)
             )
             return layout, dimensions, images, chars, horizontal_text, vertical_text
+
+        # Return data for non-rotated pages
+        return layout, dimensions, images, chars, horizontal_text, vertical_text
+
+
+
 
     def parse(
         self,
