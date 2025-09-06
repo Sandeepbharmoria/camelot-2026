@@ -105,6 +105,7 @@ class Lattice(BaseParser):
         resolution: int = 300,
         use_fallback: bool = True,
         backend: str = "pdfium",
+        intersection_epsilon: float = 0.5,
         **kwargs,
     ):
         super().__init__("lattice")
@@ -127,6 +128,7 @@ class Lattice(BaseParser):
         self.use_fallback = use_fallback
         self.icb = ImageConversionBackend(use_fallback=use_fallback, backend=backend)
         self.image_path: str | None = None
+        self.intersection_epsilon = float(intersection_epsilon)
 
         # Heavy intermediates (optionally retained)
         self.pdf_image = None
@@ -288,7 +290,7 @@ class Lattice(BaseParser):
             joints = parse["joints"]
 
             # Merge x coordinates that are close together
-            line_tol = self.line_tol
+            line_tol = max(self.line_tol, self.intersection_epsilon)
             joints_normalized = list(map(lambda x: list(x), sorted(joints, key=lambda j: -j[0])))
             for idx in range(1, len(joints_normalized)):
                 x_left, x_right = joints_normalized[idx - 1][0], joints_normalized[idx][0]
@@ -310,8 +312,9 @@ class Lattice(BaseParser):
             rows.extend([bbox[1], bbox[3]])
 
             # sort + merge near-duplicates
-            cols = merge_close_lines(sorted(cols), line_tol=self.line_tol)
-            rows = merge_close_lines(sorted(rows, reverse=True), line_tol=self.line_tol)
+            cols = merge_close_lines(sorted(cols), line_tol=line_tol)
+            rows = merge_close_lines(sorted(rows, reverse=True), line_tol=line_tol) 
+
             parse["col_anchors"] = cols
             parse["row_anchors"] = rows
 
@@ -343,7 +346,8 @@ class Lattice(BaseParser):
 
         table = self._initialize_new_table(table_idx, bbox, cols, rows)
         # set table edges to True using ver+hor lines
-        table = table.set_edges(v_s, h_s, joint_tol=self.joint_tol)
+        effective_joint_tol = max(self.joint_tol, int(round(self.intersection_epsilon)))
+        table = table.set_edges(v_s, h_s, joint_tol=effective_joint_tol)
         # set table border edges to True
         table = table.set_border()
 
