@@ -1,9 +1,9 @@
 """Implementation of the command line interface."""
 
 import logging
+import os
 
 import click
-
 
 try:
     import matplotlib.pyplot as plt
@@ -13,17 +13,15 @@ else:
     _HAS_MPL = True
 
 import importlib.metadata
-from typing import Optional
 
 from . import plot
 from . import read_pdf
-
 
 logger = logging.getLogger("camelot")
 logger.setLevel(logging.INFO)
 
 
-def get_version() -> Optional[str]:
+def get_version() -> str | None:
     """Get the version information."""
     try:
         return importlib.metadata.version("camelot-py")
@@ -50,8 +48,45 @@ class Config:
 pass_config = click.make_pass_decorator(Config)
 
 
+# Map of output filename extension -> --format value. Used by every
+# subcommand to make --format optional when the user already gave a clear
+# extension via --output. See #639.
+_OUTPUT_FORMAT_BY_EXT = {
+    ".csv": "csv",
+    ".xlsx": "excel",
+    ".xls": "excel",
+    ".html": "html",
+    ".htm": "html",
+    ".json": "json",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".sqlite": "sqlite",
+    ".sqlite3": "sqlite",
+    ".db": "sqlite",
+}
+
+
+def _infer_format(output, explicit):
+    """Pick the output format. Honour an explicit --format; else infer from output ext."""
+    if explicit is not None:
+        return explicit
+    if output is None:
+        return None
+    _, ext = os.path.splitext(output)
+    return _OUTPUT_FORMAT_BY_EXT.get(ext.lower())
+
+
 @click.group(name="camelot")
 @click.version_option(version=__version__)
+@click.pass_context
+def cli(ctx, *args, **kwargs):
+    """Camelot: PDF Table Extraction for Humans."""
+    ctx.obj = Config()
+    for key, value in kwargs.items():
+        ctx.obj.set_config(key, value)
+
+
+@cli.command("lattice")
 @click.option(
     "-q", "--quiet", is_flag=False, default=False, help="Suppress logs and warnings."
 )
@@ -59,7 +94,7 @@ pass_config = click.make_pass_decorator(Config)
     "-p",
     "--pages",
     default="1",
-    help="Comma-separated page numbers." " Example: 1,3,4 or 1,4-end or all.",
+    help="Comma-separated page numbers. Example: 1,3,4 or 1,4-end or all.",
 )
 @click.option(
     "--parallel",
@@ -68,7 +103,14 @@ pass_config = click.make_pass_decorator(Config)
     help="Read pdf pages in parallel using all CPU cores.",
 )
 @click.option("-pw", "--password", help="Password for decryption.")
-@click.option("-o", "--output", help="Output file path.")
+@click.option(
+    "-o",
+    "--output",
+    help="Output file path. Treated as a template — each detected table is "
+    "written to '<output_stem>-page-<P>-table-<T>.<ext>'. If --format is "
+    "omitted, the format is inferred from the path's extension "
+    "(.csv, .xlsx, .html, .json, .md, .sqlite, etc.).",
+)
 @click.option(
     "-f",
     "--format",
@@ -86,7 +128,7 @@ pass_config = click.make_pass_decorator(Config)
     "-flag",
     "--flag_size",
     is_flag=True,
-    help="Flag text based on" " font size. Useful to detect super/subscripts.",
+    help="Flag text based on font size. Useful to detect super/subscripts.",
 )
 @click.option(
     "-strip",
@@ -101,15 +143,6 @@ pass_config = click.make_pass_decorator(Config)
     default=(1.0, 0.5, 0.1),
     help="PDFMiner char_margin, line_margin and word_margin.",
 )
-@click.pass_context
-def cli(ctx, *args, **kwargs):
-    """Camelot: PDF Table Extraction for Humans."""
-    ctx.obj = Config()
-    for key, value in kwargs.items():
-        ctx.obj.set_config(key, value)
-
-
-@cli.command("lattice")
 @click.option(
     "-R",
     "--table_regions",
@@ -132,7 +165,7 @@ def cli(ctx, *args, **kwargs):
 @click.option(
     "-scale",
     "--line_scale",
-    default=40,
+    default=15,
     help="Line size scaling factor. The larger the value,"
     " the smaller the detected lines.",
 )
@@ -142,7 +175,7 @@ def cli(ctx, *args, **kwargs):
     default=[],
     type=click.Choice(["h", "v"]),
     multiple=True,
-    help="Direction in which text in a spanning cell" " will be copied over.",
+    help="Direction in which text in a spanning cell will be copied over.",
 )
 @click.option(
     "-shift",
@@ -156,7 +189,7 @@ def cli(ctx, *args, **kwargs):
     "-l",
     "--line_tol",
     default=2,
-    help="Tolerance parameter used to merge close vertical" " and horizontal lines.",
+    help="Tolerance parameter used to merge close vertical and horizontal lines.",
 )
 @click.option(
     "-j",
@@ -203,15 +236,13 @@ def cli(ctx, *args, **kwargs):
 @pass_config
 def lattice(c, *args, **kwargs):
     """Use lines between text to parse the table."""
-    conf = c.config
-    pages = conf.pop("pages")
-    output = conf.pop("output")
-    f = conf.pop("format")
-    compress = conf.pop("zip")
-    quiet = conf.pop("quiet")
+    pages = kwargs.pop("pages")
+    output = kwargs.pop("output")
+    f = _infer_format(output, kwargs.pop("format"))
+    compress = kwargs.pop("zip")
+    quiet = kwargs.pop("quiet")
     plot_type = kwargs.pop("plot_type")
     filepath = kwargs.pop("filepath")
-    kwargs.update(conf)
 
     table_regions = list(kwargs["table_regions"])
     kwargs["table_regions"] = None if not table_regions else table_regions
@@ -244,6 +275,62 @@ def lattice(c, *args, **kwargs):
 
 @cli.command("stream")
 @click.option(
+    "-q", "--quiet", is_flag=False, default=False, help="Suppress logs and warnings."
+)
+@click.option(
+    "-p",
+    "--pages",
+    default="1",
+    help="Comma-separated page numbers. Example: 1,3,4 or 1,4-end or all.",
+)
+@click.option(
+    "--parallel",
+    is_flag=True,
+    default=False,
+    help="Read pdf pages in parallel using all CPU cores.",
+)
+@click.option("-pw", "--password", help="Password for decryption.")
+@click.option(
+    "-o",
+    "--output",
+    help="Output file path. Treated as a template — each detected table is "
+    "written to '<output_stem>-page-<P>-table-<T>.<ext>'. If --format is "
+    "omitted, the format is inferred from the path's extension "
+    "(.csv, .xlsx, .html, .json, .md, .sqlite, etc.).",
+)
+@click.option(
+    "-f",
+    "--format",
+    type=click.Choice(["csv", "excel", "html", "json", "markdown", "sqlite"]),
+    help="Output file format.",
+)
+@click.option("-z", "--zip", is_flag=True, help="Create ZIP archive.")
+@click.option(
+    "-split",
+    "--split_text",
+    is_flag=True,
+    help="Split text that spans across multiple cells.",
+)
+@click.option(
+    "-flag",
+    "--flag_size",
+    is_flag=True,
+    help="Flag text based on font size. Useful to detect super/subscripts.",
+)
+@click.option(
+    "-strip",
+    "--strip_text",
+    help="Characters that should be stripped from a string before"
+    " assigning it to a cell.",
+)
+@click.option(
+    "-M",
+    "--margins",
+    nargs=3,
+    default=(1.0, 0.5, 0.1),
+    help="PDFMiner char_margin, line_margin and word_margin.",
+)
+@click.option(
     "-R",
     "--table_regions",
     default=[],
@@ -270,20 +357,19 @@ def lattice(c, *args, **kwargs):
     "-e",
     "--edge_tol",
     default=50,
-    help="Tolerance parameter" " for extending textedges vertically.",
+    help="Tolerance parameter for extending textedges vertically.",
 )
 @click.option(
     "-r",
     "--row_tol",
     default=2,
-    help="Tolerance parameter" " used to combine text vertically, to generate rows.",
+    help="Tolerance parameter used to combine text vertically, to generate rows.",
 )
 @click.option(
     "-c",
     "--column_tol",
     default=0,
-    help="Tolerance parameter"
-    " used to combine text horizontally, to generate columns.",
+    help="Tolerance parameter used to combine text horizontally, to generate columns.",
 )
 @click.option(
     "-plot",
@@ -295,15 +381,13 @@ def lattice(c, *args, **kwargs):
 @pass_config
 def stream(c, *args, **kwargs):
     """Use spaces between text to parse the table."""
-    conf = c.config
-    pages = conf.pop("pages")
-    output = conf.pop("output")
-    f = conf.pop("format")
-    compress = conf.pop("zip")
-    quiet = conf.pop("quiet")
+    pages = kwargs.pop("pages")
+    output = kwargs.pop("output")
+    f = _infer_format(output, kwargs.pop("format"))
+    compress = kwargs.pop("zip")
+    quiet = kwargs.pop("quiet")
     plot_type = kwargs.pop("plot_type")
     filepath = kwargs.pop("filepath")
-    kwargs.update(conf)
 
     table_regions = list(kwargs["table_regions"])
     kwargs["table_regions"] = None if not table_regions else table_regions
@@ -312,7 +396,7 @@ def stream(c, *args, **kwargs):
     columns = list(kwargs["columns"])
     kwargs["columns"] = None if not columns else columns
 
-    margins = conf.pop("margins")
+    margins = kwargs.pop("margins")
 
     if margins is None:
         layout_kwargs = {}
@@ -351,6 +435,62 @@ def stream(c, *args, **kwargs):
 
 @cli.command("hybrid")
 @click.option(
+    "-q", "--quiet", is_flag=False, default=False, help="Suppress logs and warnings."
+)
+@click.option(
+    "-p",
+    "--pages",
+    default="1",
+    help="Comma-separated page numbers. Example: 1,3,4 or 1,4-end or all.",
+)
+@click.option(
+    "--parallel",
+    is_flag=True,
+    default=False,
+    help="Read pdf pages in parallel using all CPU cores.",
+)
+@click.option("-pw", "--password", help="Password for decryption.")
+@click.option(
+    "-o",
+    "--output",
+    help="Output file path. Treated as a template — each detected table is "
+    "written to '<output_stem>-page-<P>-table-<T>.<ext>'. If --format is "
+    "omitted, the format is inferred from the path's extension "
+    "(.csv, .xlsx, .html, .json, .md, .sqlite, etc.).",
+)
+@click.option(
+    "-f",
+    "--format",
+    type=click.Choice(["csv", "excel", "html", "json", "markdown", "sqlite"]),
+    help="Output file format.",
+)
+@click.option("-z", "--zip", is_flag=True, help="Create ZIP archive.")
+@click.option(
+    "-split",
+    "--split_text",
+    is_flag=True,
+    help="Split text that spans across multiple cells.",
+)
+@click.option(
+    "-flag",
+    "--flag_size",
+    is_flag=True,
+    help="Flag text based on font size. Useful to detect super/subscripts.",
+)
+@click.option(
+    "-strip",
+    "--strip_text",
+    help="Characters that should be stripped from a string before"
+    " assigning it to a cell.",
+)
+@click.option(
+    "-M",
+    "--margins",
+    nargs=3,
+    default=(1.0, 0.5, 0.1),
+    help="PDFMiner char_margin, line_margin and word_margin.",
+)
+@click.option(
     "-R",
     "--table_regions",
     default=[],
@@ -377,20 +517,19 @@ def stream(c, *args, **kwargs):
     "-e",
     "--edge_tol",
     default=50,
-    help="Tolerance parameter" " for extending textedges vertically.",
+    help="Tolerance parameter for extending textedges vertically.",
 )
 @click.option(
     "-r",
     "--row_tol",
     default=2,
-    help="Tolerance parameter" " used to combine text vertically, to generate rows.",
+    help="Tolerance parameter used to combine text vertically, to generate rows.",
 )
 @click.option(
     "-c",
     "--column_tol",
     default=0,
-    help="Tolerance parameter"
-    " used to combine text horizontally, to generate columns.",
+    help="Tolerance parameter used to combine text horizontally, to generate columns.",
 )
 @click.option(
     "-plot",
@@ -402,15 +541,13 @@ def stream(c, *args, **kwargs):
 @pass_config
 def hybrid(c, *args, **kwargs):
     """Combines the strengths of both the Network and the Lattice parser."""
-    conf = c.config
-    pages = conf.pop("pages")
-    output = conf.pop("output")
-    f = conf.pop("format")
-    compress = conf.pop("zip")
-    quiet = conf.pop("quiet")
+    pages = kwargs.pop("pages")
+    output = kwargs.pop("output")
+    f = _infer_format(output, kwargs.pop("format"))
+    compress = kwargs.pop("zip")
+    quiet = kwargs.pop("quiet")
     plot_type = kwargs.pop("plot_type")
     filepath = kwargs.pop("filepath")
-    kwargs.update(conf)
 
     table_regions = list(kwargs["table_regions"])
     kwargs["table_regions"] = None if not table_regions else table_regions
@@ -442,6 +579,62 @@ def hybrid(c, *args, **kwargs):
 
 @cli.command("network")
 @click.option(
+    "-q", "--quiet", is_flag=False, default=False, help="Suppress logs and warnings."
+)
+@click.option(
+    "-p",
+    "--pages",
+    default="1",
+    help="Comma-separated page numbers. Example: 1,3,4 or 1,4-end or all.",
+)
+@click.option(
+    "--parallel",
+    is_flag=True,
+    default=False,
+    help="Read pdf pages in parallel using all CPU cores.",
+)
+@click.option("-pw", "--password", help="Password for decryption.")
+@click.option(
+    "-o",
+    "--output",
+    help="Output file path. Treated as a template — each detected table is "
+    "written to '<output_stem>-page-<P>-table-<T>.<ext>'. If --format is "
+    "omitted, the format is inferred from the path's extension "
+    "(.csv, .xlsx, .html, .json, .md, .sqlite, etc.).",
+)
+@click.option(
+    "-f",
+    "--format",
+    type=click.Choice(["csv", "excel", "html", "json", "markdown", "sqlite"]),
+    help="Output file format.",
+)
+@click.option("-z", "--zip", is_flag=True, help="Create ZIP archive.")
+@click.option(
+    "-split",
+    "--split_text",
+    is_flag=True,
+    help="Split text that spans across multiple cells.",
+)
+@click.option(
+    "-flag",
+    "--flag_size",
+    is_flag=True,
+    help="Flag text based on font size. Useful to detect super/subscripts.",
+)
+@click.option(
+    "-strip",
+    "--strip_text",
+    help="Characters that should be stripped from a string before"
+    " assigning it to a cell.",
+)
+@click.option(
+    "-M",
+    "--margins",
+    nargs=3,
+    default=(1.0, 0.5, 0.1),
+    help="PDFMiner char_margin, line_margin and word_margin.",
+)
+@click.option(
     "-R",
     "--table_regions",
     default=[],
@@ -468,20 +661,19 @@ def hybrid(c, *args, **kwargs):
     "-e",
     "--edge_tol",
     default=50,
-    help="Tolerance parameter" " for extending textedges vertically.",
+    help="Tolerance parameter for extending textedges vertically.",
 )
 @click.option(
     "-r",
     "--row_tol",
     default=2,
-    help="Tolerance parameter" " used to combine text vertically, to generate rows.",
+    help="Tolerance parameter used to combine text vertically, to generate rows.",
 )
 @click.option(
     "-c",
     "--column_tol",
     default=0,
-    help="Tolerance parameter"
-    " used to combine text horizontally, to generate columns.",
+    help="Tolerance parameter used to combine text horizontally, to generate columns.",
 )
 @click.option(
     "-plot",
@@ -493,15 +685,13 @@ def hybrid(c, *args, **kwargs):
 @pass_config
 def network(c, *args, **kwargs):
     """Use text alignments to parse the table."""
-    conf = c.config
-    pages = conf.pop("pages")
-    output = conf.pop("output")
-    f = conf.pop("format")
-    compress = conf.pop("zip")
-    quiet = conf.pop("quiet")
+    pages = kwargs.pop("pages")
+    output = kwargs.pop("output")
+    f = _infer_format(output, kwargs.pop("format"))
+    compress = kwargs.pop("zip")
+    quiet = kwargs.pop("quiet")
     plot_type = kwargs.pop("plot_type")
     filepath = kwargs.pop("filepath")
-    kwargs.update(conf)
 
     table_regions = list(kwargs["table_regions"])
     kwargs["table_regions"] = None if not table_regions else table_regions

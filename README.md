@@ -4,11 +4,26 @@
 
 # Camelot: PDF Table Extraction for Humans
 
-[![tests](https://github.com/camelot-dev/camelot/actions/workflows/tests.yml/badge.svg)](https://github.com/camelot-dev/camelot/actions/workflows/tests.yml) [![Documentation Status](https://readthedocs.org/projects/camelot-py/badge/?version=master)](https://camelot-py.readthedocs.io/en/master/)
+[![tests](https://github.com/camelot-dev/camelot/actions/workflows/tests.yml/badge.svg)](https://github.com/camelot-dev/camelot/actions/workflows/tests.yml) [![Documentation Status](https://readthedocs.org/projects/camelot-py/badge/?version=latest)](https://camelot-py.readthedocs.io/en/latest/)
 [![codecov.io](https://codecov.io/github/camelot-dev/camelot/badge.svg?branch=master&service=github)](https://codecov.io/github/camelot-dev/camelot?branch=master)
 [![image](https://img.shields.io/pypi/v/camelot-py.svg)](https://pypi.org/project/camelot-py/) [![image](https://img.shields.io/pypi/l/camelot-py.svg)](https://pypi.org/project/camelot-py/) [![image](https://img.shields.io/pypi/pyversions/camelot-py.svg)](https://pypi.org/project/camelot-py/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff) [![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit)](https://github.com/pre-commit/pre-commit)
 
 **Camelot** is a Python library that can help you extract tables from PDFs.
+
+## Features
+
+- 📊 **Five parsers** — `lattice` (ruled tables), `stream` (whitespace), the text-alignment `network` / `hybrid`, and the optional neural `ml` (Table Transformer) for hard borderless tables — plus `flavor="auto"` to pick one for you.
+- 🤖 **Borderless & scanned** — the optional `ml` backend (`pip install "camelot-py[ml]"`) recovers structure that the heuristic parsers can't on borderless tables; add `[ocr]` to read **scanned / image-only PDFs** with no text layer.
+- 🧠 **Vector + raster line detection** — `engine="combined"` unions the PDF's native vector ruled lines with OpenCV detection, so faintly-ruled tables are still found.
+- 🐼 **pandas output** — every table is a `DataFrame`, ready for analysis.
+- 📤 **Many export formats** — CSV, JSON, Excel, HTML, Markdown, and SQLite.
+- 📐 **Quality metrics** — accuracy, whitespace, and a confidence score per table; drop noise with `TableList.filter(...)`.
+- 🧩 **Multi-page tables** — stitch continuations across pages with `stack_contiguous()`.
+- 🎛️ **Highly configurable** — table areas/regions, column separators, text processing, and more.
+- 🔌 **Flexible input** — a file path, URL, raw `bytes`, or any binary file-like object.
+- 🖥️ **CLI included** — `camelot lattice file.pdf`, etc.
+- 📦 **Light install** — the default pdfium backend is bundled, with no system dependencies.
 
 ---
 
@@ -52,9 +67,23 @@ Refer to the [QuickStart Guide](https://github.com/camelot-dev/camelot/blob/mast
 
 **Tip:** Visit the `parser-comparison-notebook` to get an overview of all the packed parsers and their features. [![image](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/camelot-dev/camelot/blob/master/examples/parser-comparison-notebook.ipynb)
 
-**Note:** Camelot only works with text-based PDFs and not scanned documents. (As Tabula [explains](https://github.com/tabulapdf/tabula#why-tabula), "If you can click and drag to select text in your table in a PDF viewer, then your PDF is text-based".)
+**Note:** The built-in parsers need a text-based PDF (as Tabula [explains](https://github.com/tabulapdf/tabula#why-tabula), "If you can click and drag to select text in your table in a PDF viewer, then your PDF is text-based"). For **scanned / image-only** PDFs, install the neural backend with OCR — `pip install "camelot-py[ml,ocr]"` — and use `camelot.read_pdf(..., flavor="ml")`: the model reads the structure from the page image and OCR supplies the text.
 
 You can check out some frequently asked questions [here](https://camelot-py.readthedocs.io/en/latest/user/faq.html).
+
+## Which parser should I use?
+
+| Your PDF                                      | Use                                                | Why                                                                                                                                                               |
+| --------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Ruled tables** (lines between cells)        | `flavor="lattice"` (default)                       | Deterministic; detects the grid from the ruled lines. `engine="combined"` also catches faint vector rules.                                                        |
+| **Borderless tables** (whitespace-separated)  | `flavor="network"` or `"stream"`                   | Text-alignment / whitespace heuristics — fast, no extra dependencies.                                                                                             |
+| **Borderless tables, best quality**           | `flavor="ml"` (`pip install "camelot-py[ml]"`)     | A Table Transformer model recovers structure heuristics can't — on FinTabNet it roughly doubles borderless TEDS vs `network`/`hybrid`. Heavier (PyTorch); opt-in. |
+| **Scanned / image-only PDFs** (no text layer) | `flavor="ml"` + `pip install "camelot-py[ml,ocr]"` | Structure from the model, text from OCR.                                                                                                                          |
+| **Mixed / not sure**                          | `flavor="auto"`                                    | Picks `lattice` or `network` per page.                                                                                                                            |
+
+The `ml` backend keeps Camelot honest: the model only supplies the table
+**structure**, while cell **text** comes from the PDF's own text layer (or OCR
+for scans) — so it never invents or alters a value.
 
 ## Why Camelot?
 
@@ -62,54 +91,68 @@ You can check out some frequently asked questions [here](https://camelot-py.read
 - **Metrics**: You can discard bad tables based on metrics like accuracy and whitespace, without having to manually look at each table.
 - **Output**: Each table is extracted into a **pandas DataFrame**, which seamlessly integrates into [ETL and data analysis workflows](https://gist.github.com/vinayak-mehta/e5949f7c2410a0e12f25d3682dc9e873). You can also export tables to multiple formats, which include CSV, JSON, Excel, HTML, Markdown, and Sqlite.
 
-See [comparison with similar libraries and tools](https://github.com/camelot-dev/camelot/wiki/Comparison-with-other-PDF-Table-Extraction-libraries-and-tools).
+See [comparison with similar libraries and tools](https://camelot-py.readthedocs.io/en/latest/user/comparison.html).
 
 ## Installation
 
-### Using conda
+Camelot's default image-conversion backend is [pdfium](https://pypi.org/project/pypdfium2/), which ships as a wheel — so a plain install needs **no system dependencies**. The optional [ghostscript](https://www.ghostscript.com/) and poppler backends require [additional dependencies](https://camelot-py.readthedocs.io/en/latest/user/install-deps.html).
 
-The easiest way to install Camelot is with [conda](https://conda.io/docs/), which is a package manager and environment management system for the [Anaconda](http://docs.continuum.io/anaconda/) distribution.
+### Using uv
+
+[uv](https://docs.astral.sh/uv/) is a fast Python package and project manager. To add Camelot to a project:
 
 ```bash
-conda install -c conda-forge camelot-py
+uv add camelot-py
+```
+
+Or to install it into the current environment:
+
+```bash
+uv pip install camelot-py
 ```
 
 ### Using pip
-
-You can also use pip to install Camelot:
 
 ```bash
 pip install "camelot-py"
 ```
 
-Note that [additional dependencies](https://camelot-py.readthedocs.io/en/latest/user/install-deps.html) may be required if you want to use the non-default backend [ghostscript](https://www.ghostscript.com/).
+### Using conda
+
+[conda](https://conda.io/docs/) is the package manager for the [Anaconda](http://docs.continuum.io/anaconda/) distribution:
+
+```bash
+conda install -c conda-forge camelot-py
+```
 
 ### From the source code
 
 ```bash
 git clone https://github.com/camelot-dev/camelot.git
-```
-
-and install using pip:
-
-```
 cd camelot
-pip install "."
+uv pip install "."  # or: pip install "."
 ```
 
-Note that [additional dependencies](https://camelot-py.readthedocs.io/en/latest/user/install-deps.html) may be required if you want to use the non-default backend [ghostscript](https://www.ghostscript.com/).
+### Optional extras
+
+```bash
+pip install "camelot-py[ml]"      # neural flavor='ml' (Table Transformer; pulls PyTorch)
+pip install "camelot-py[ocr]"     # OCR text source for scanned PDFs (use with [ml])
+pip install "camelot-py[ml,ocr]"  # both — borderless + scanned
+pip install "camelot-py[plot]"    # matplotlib debug plots
+```
+
+The core install stays light: `[ml]`/`[ocr]` are imported lazily, so a plain
+`import camelot` never loads PyTorch or OCR.
+
+> **Note** — `[ocr]` pulls `rapidocr-onnxruntime`, which hard-requires the full
+> `opencv-python` even though Camelot itself uses `opencv-python-headless`. See
+> [the install docs](https://camelot-py.readthedocs.io/en/latest/user/install.html#the-ocr-extra-and-opencv-python)
+> for how to keep the headless build only.
 
 ## Documentation
 
 The documentation is available at [http://camelot-py.readthedocs.io/](http://camelot-py.readthedocs.io/).
-
-## Wrappers
-
-- [camelot-php](https://github.com/randomstate/camelot-php) provides a [PHP](https://www.php.net/) wrapper on Camelot.
-
-## Related projects
-
-- [camelot-sharp](https://github.com/BobLd/camelot-sharp) provides a C sharp implementation of Camelot.
 
 ## Contributing
 
@@ -123,4 +166,4 @@ Camelot uses [Semantic Versioning](https://semver.org/). For the available versi
 
 This project is licensed under the MIT License, see the [LICENSE](https://github.com/camelot-dev/camelot/blob/master/LICENSE) file for details.
 
-The documentation theme is licensed under a seperate BSD-like License, see the [LICENSE](https://github.com/camelot-dev/camelot/blob/master/docs/_themes/LICENSE) file for details.
+The documentation theme is licensed under a separate BSD-like License, see the [LICENSE](https://github.com/camelot-dev/camelot/blob/master/docs/_themes/LICENSE) file for details.

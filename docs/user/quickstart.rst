@@ -21,7 +21,7 @@ Begin by importing the Camelot module::
 
 Now, let's try to read a PDF. (You can check out the PDF used in this example `here`_.) Since the PDF has a table with clearly demarcated lines, we will use the :ref:`Lattice <lattice>` method here.
 
-.. note:: :ref:`Lattice <lattice>` is used by default. You can use :ref:`Stream <stream>` with ``flavor='stream'``.
+.. note:: :ref:`Lattice <lattice>` is used by default. You can use :ref:`Stream <stream>` with ``flavor='stream'``, :ref:`Network <network>` with ``flavor='network'``, :ref:`Hybrid <hybrid>` with ``flavor='hybrid'``, or ``flavor='auto'`` to let Camelot probe the first page and choose between ``lattice`` and ``network``. When ``auto`` is selected a ``UserWarning`` names the chosen flavor.
 
 .. _here: ../_static/pdf/foo.pdf
 
@@ -30,6 +30,8 @@ Now, let's try to read a PDF. (You can check out the PDF used in this example `h
     >>> tables = camelot.read_pdf('foo.pdf')
     >>> tables
     <TableList n=1>
+
+You can also pass raw PDF bytes or any binary stream (``io.BytesIO``, an open ``'rb'`` file, ``requests`` response ``.raw``) wherever a filepath is accepted — useful for PDFs that arrive over HTTP without hitting disk first. See the :ref:`Reading PDFs from memory <advanced>` section in the advanced guide for the full pattern.
 
 Now, we have a :class:`TableList <camelot.core.TableList>` object called ``tables``, which is a list of :class:`Table <camelot.core.Table>` objects. We can get everything we need from this object.
 
@@ -44,15 +46,16 @@ Let's print the parsing report.
 
 ::
 
-    >>> print tables[0].parsing_report
+    >>> print(tables[0].parsing_report)
     {
         'accuracy': 99.02,
         'whitespace': 12.24,
+        'confidence': 0.87,
         'order': 1,
         'page': 1
     }
 
-Woah! The accuracy is top-notch and there is less whitespace, which means the table was most likely extracted correctly. You can access the table as a pandas DataFrame by using the :class:`table <camelot.core.Table>` object's ``df`` property.
+Woah! The accuracy is top-notch and there is less whitespace, which means the table was most likely extracted correctly. The ``confidence`` value is a single ``[0, 1]`` score computed as ``(accuracy / 100) * (1 - whitespace / 100)`` — convenient for "keep tables above X" filtering in production pipelines without having to combine the two raw fields yourself. You can access the table as a pandas DataFrame by using the :class:`table <camelot.core.Table>` object's ``df`` property.
 
 ::
 
@@ -104,6 +107,12 @@ By default, Camelot only uses the first page of the PDF to extract tables. To sp
 
 The ``pages`` keyword argument accepts pages as comma-separated string of page numbers. You can also specify page ranges — for example, ``pages=1,4-10,20-30`` or ``pages=1,4-10,20-end``.
 
+When ``parallel=True``, Camelot processes pages concurrently using one worker per CPU. Bound the worker count with ``cpu_count=N`` (defaults to all cores; clamped to ``[1, multiprocessing.cpu_count()]``)::
+
+    >>> camelot.read_pdf('long.pdf', pages='all', parallel=True, cpu_count=4)
+
+If different pages need different settings (per-page ``table_areas``, a different ``flavor`` on one page, etc.), use the ``per_page`` keyword argument. See the :ref:`Per-page parameter overrides <advanced>` section in the advanced guide.
+
 Reading encrypted PDFs
 ----------------------
 
@@ -121,7 +130,7 @@ To extract tables from encrypted PDF files you must provide a password when call
 
         $ camelot --password userpass lattice foo.pdf
 
-Camelot supports PDFs with all encryption types supported by `pypdf`_. This might require installing PyCryptodome. An exception is thrown if the PDF cannot be read. This may be due to no password being provided, an incorrect password, or an unsupported encryption algorithm.
+Camelot supports PDFs with all encryption types supported by `playa`_. This might require installing PyCryptodome. An exception is thrown if the PDF cannot be read. This may be due to no password being provided, an incorrect password, or an unsupported encryption algorithm.
 
 Further encryption support may be added in future, however in the meantime if your PDF files are using unsupported encryption algorithms you are advised to remove encryption before calling :meth:`read_pdf() <camelot.read_pdf>`. This can been successfully achieved with third-party tools such as `QPDF`_.
 
@@ -129,7 +138,7 @@ Further encryption support may be added in future, however in the meantime if yo
 
     $ qpdf --password=<PASSWORD> --decrypt input.pdf output.pdf
 
-.. _pypdf: https://pypdf.readthedocs.io/en/latest/user/pdf-version-support.html
+.. _playa: https://pypi.org/project/playa-pdf/
 .. _QPDF: https://www.github.com/qpdf/qpdf
 
 ----

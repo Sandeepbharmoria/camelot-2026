@@ -19,7 +19,7 @@ Where *Hybrid* is a combination of the *Network* and *Lattice* parser.
 Stream
 ------
 
-Stream can be used to parse tables that have whitespaces between cells to simulate a table structure. It is built on top of PDFMiner's functionality of grouping characters on a page into words and sentences, using `margins <https://pdfminersix.readthedocs.io/en/latest/reference/commandline.html>`_.
+Stream can be used to parse tables that have whitespaces between cells to simulate a table structure. It is built on top of `playa <https://pypi.org/project/playa-pdf/>`_'s PDFMiner-compatible functionality for grouping characters on a page into words and sentences, using `margins <https://pdfminersix.readthedocs.io/en/latest/reference/commandline.html>`_.
 
 1. Words on the PDF page are grouped into text rows based on their *y* axis overlaps.
 
@@ -39,6 +39,19 @@ Lattice
 Lattice is more deterministic in nature, and it does not rely on guesses. It can be used to parse tables that have demarcated lines between cells, and it can automatically parse multiple tables present on a page.
 
 It starts by converting the PDF page to an image using an image conversion backend (default pdfium), and then processes it to get horizontal and vertical line segments by applying a set of morphological transformations (erosion and dilation) using OpenCV.
+
+.. note::
+
+   That image-based (*raster*) line detection is the default. When a PDF
+   draws its rules as native vector graphics, those exact line
+   coordinates are already in the document — and they sometimes render
+   too faintly for the rasteriser to pick up. The ``engine='combined'``
+   option (see :ref:`line_detection_engine`) reads those vector lines
+   directly and **unions** them into the rasterised line masks before the
+   grid below is reconstructed, so faintly-ruled vector tables are still
+   found. Because raster detection always runs first, the vector lines
+   can only add to the result — ``'combined'`` is never worse than the
+   default ``'raster'``.
 
 Let's see how Lattice processes the second page of `this PDF`_, step-by-step.
 
@@ -103,13 +116,18 @@ Network
 
 The network parser is text-based: it relies on the bounding boxes of the text elements encoded in the .pdf document to identify patterns indicative of a table.
 
-The plot belows shows the bounding boxes of all the text elements on the parsed document, in light blue for horizontal elements, light red for vertical elements (rare in most documents).
+The parser starts by enumerating the bounding boxes of every text element on the page — typically horizontal-running boxes (the bulk of the text) and occasional vertical-running boxes (rare in most documents).
+
+The plot below shows the bounding boxes of all the text elements found on the page (here the ``network`` parser running on a public-health table):
+
+.. image:: ../_static/png/plot_network_text.png
+    :align: center
 
 1. The network parser starts by identifying common horizontal or vertical coordinate alignments across these text elements. In other words it looks for bounding box rectangles which either share the same top, center, or bottom coordinates (horizontal axis), or the same left, right, or middle coordinates (vertical axis). See the generate method.
 
 Once the parser found these alignments, it performs some pruning to only keep text elements that are part of a network - they have connections along both axis The idea is that it's not enough for two elements to be aligned to belong to a table, for instance the lines of text in this paragraph are all left-aligned, but they do not form a network. The pruning is done iteratively, see "remove_unconnected_edges" method.
 
-Once the network is pruned, the parser keeps track of how many alignments each text element belongs to: that's the number on top (vertical alignments) or to the left of each alignment in the plot below. The text element with the most connections (in red on the plot) is the starting point -the seed- of the next step. Finally, the parser measures how far the alignments are from one another, to determine a plausible search zone around each cell for the next stage of growing the table. See "compute_plausible_gaps" method.
+Once the network is pruned, the parser counts how many alignments each text element belongs to. The text element with the most connections is the starting point — the *seed* — of the next step. Finally, the parser measures how far the alignments are from one another, to determine a plausible search zone around each cell for the next stage of growing the table. See "compute_plausible_gaps" method.
 
 2. n the next step, the parser iteratively "grows" a table, starting from the seed identified in the previous step. The bounding box is initialized with the bounding box of the seed, then it iteratively searches for text elements that are close to the bounding box, then grows the table to ingest them, until there are no more text elements to ingest. The two steps are:
 
@@ -134,3 +152,70 @@ The hybrid parser aims to combine the strengths of the Network parser (identifyi
 1. Hybrid calls both parsers, to get a) the standard table parse, b) the coordinates of the rows and columns boundaries, and c) the table boundaries (or contour).
 
 2. If there are areas in the document where both lattice and network found a table, the hybrid parser uses the results from network, but enhances them based on the rows/columns boundaries identified by lattice in the area. Because lattice uses the solid lines detected on the document, the coordinates for b) and c) detected by Lattice are generally more precise. See the "_merge_bbox_analysis" method.
+
+.. _ml:
+
+ML (Table Transformer)
+----------------------
+
+``flavor='ml'`` is an **optional** neural backend for the tables the
+heuristic parsers find hardest — dense **borderless** tables — and, with
+OCR, for **scanned / image-only** PDFs. It is opt-in because it pulls
+PyTorch: ``pip install 'camelot-py[ml]'`` (add ``[ocr]`` for scans).
+
+Its guiding rule is **the model supplies the structure, the page supplies
+the text**:
+
+1. The page is rendered to an image. A `Table Transformer (TATR)
+   <https://github.com/microsoft/table-transformer>`_ detection model finds
+   the table region(s); a second TATR model recognises the **structure** —
+   rows, columns and spanning cells — as bounding boxes.
+2. Those boxes are turned into the same column/row/spanning grid the other
+   parsers build, then mapped from image space back to PDF coordinates.
+3. Each cell's **text** is filled from the PDF's own text layer (the exact
+   characters), reusing the same assignment step as every other flavor — so
+   the model never emits a character of cell text and **cannot hallucinate
+   or alter a value**. For scanned pages with no text layer, ``ocr='auto'``
+   reads the text from the rendered image instead (still geometry +
+   recognised text, never invented cells).
+
+Because the structure half runs on the page image, ``flavor='ml'`` is the
+only parser that works without a text layer at all.
+
+Borderless accuracy
+~~~~~~~~~~~~~~~~~~~~~
+
+On the borderless `FinTabNet.c <https://github.com/ibm-aur-nlp/PubTabNet>`_
+benchmark (545 financial PDFs, ``bench/benchmark_fintabnet.py``), the model
+backend clears the ceiling the heuristic parsers plateau at:
+
+.. list-table::
+   :header-rows: 1
+
+   * - flavor
+     - F1
+     - TEDS
+     - row
+     - col
+   * - **ml**
+     - 0.750
+     - 0.371
+     - 0.235
+     - 0.570
+   * - network
+     - 0.725
+     - 0.200
+     - 0.109
+     - 0.220
+   * - hybrid (combined)
+     - 0.658
+     - 0.198
+     - 0.109
+     - 0.217
+
+(``TEDS``/``row``/``col`` from ``bench/_metrics.py``; ``TEDS`` here is a
+difflib cell-text proxy, not exact tree-edit distance, so the absolute
+values are conservative — the point is the **relative** gap: ``ml`` roughly
+doubles borderless ``TEDS`` over ``network``/``hybrid``.) The trade-off is
+speed (~1 s/page with a GPU vs tens of ms for ``network``) and the optional
+PyTorch dependency, which is why it is opt-in rather than the default.

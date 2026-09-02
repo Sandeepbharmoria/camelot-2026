@@ -1,3 +1,4 @@
+import importlib.metadata
 import os
 import sys
 import warnings
@@ -18,7 +19,9 @@ def test_help_output():
     output = result.output
 
     assert prog_name == "camelot"
-    assert result.output.startswith("Usage: %(prog_name)s [OPTIONS] COMMAND" % locals())
+    assert result.output.startswith(
+        "Usage: {prog_name} [OPTIONS] COMMAND".format(**locals())
+    )
     assert all(
         v in result.output
         for v in ["Options:", "--version", "--help", "Commands:", "lattice", "stream"]
@@ -32,18 +35,26 @@ def test_cli_lattice(testdir):
         outfile = os.path.join(tempdir, "foo.csv")
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["--format", "csv", "--output", outfile, "lattice", infile]
+            cli, ["lattice", "--format", "csv", "--output", outfile, infile]
         )
         assert result.exit_code == 0
         assert "Found 1 tables" in result.output
 
-        result = runner.invoke(cli, ["--format", "csv", "lattice", infile])
+        result = runner.invoke(cli, ["lattice", "--format", "csv", infile])
         output_error = "Error: Please specify output file path using --output"
         assert output_error in result.output
 
-        result = runner.invoke(cli, ["--output", outfile, "lattice", infile])
-        format_error = "Please specify output file format using --format"
-        assert format_error in result.output
+        # #639: with --format omitted but --output carrying a known extension
+        # (.csv here), the format is inferred — the run succeeds rather than
+        # bailing out with "Please specify output file format using --format".
+        result = runner.invoke(cli, ["lattice", "--output", outfile, infile])
+        assert result.exit_code == 0, result.output
+        assert "Found 1 tables" in result.output
+
+        # When the --output extension is unknown, the format error still fires.
+        unknown_out = os.path.join(tempdir, "foo")
+        result = runner.invoke(cli, ["lattice", "--output", unknown_out, infile])
+        assert "Please specify output file format using --format" in result.output
 
 
 def test_cli_stream(testdir):
@@ -52,22 +63,24 @@ def test_cli_stream(testdir):
         outfile = os.path.join(tempdir, "budget.csv")
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["--format", "csv", "--output", outfile, "stream", infile]
+            cli, ["stream", "--format", "csv", "--output", outfile, infile]
         )
         assert result.exit_code == 0
         assert result.output == "Found 1 tables\n"
 
-        result = runner.invoke(cli, ["--format", "csv", "stream", infile])
+        result = runner.invoke(cli, ["stream", "--format", "csv", infile])
         output_error = "Error: Please specify output file path using --output"
         assert output_error in result.output
 
-        result = runner.invoke(cli, ["--output", outfile, "stream", infile])
-        format_error = "Please specify output file format using --format"
-        assert format_error in result.output
+        # #639: --format inferred from .csv extension when --output is given.
+        result = runner.invoke(cli, ["stream", "--output", outfile, infile])
+        assert result.exit_code == 0, result.output
+        assert "Found 1 tables" in result.output
 
         result = runner.invoke(
             cli,
             [
+                "stream",
                 "--margins",
                 "1.5",
                 "0.5",
@@ -76,7 +89,6 @@ def test_cli_stream(testdir):
                 "csv",
                 "--output",
                 outfile,
-                "stream",
                 infile,
             ],
         )
@@ -86,6 +98,7 @@ def test_cli_stream(testdir):
         result = runner.invoke(
             cli,
             [
+                "stream",
                 "--margins",
                 "1.5",
                 "0.5",
@@ -93,7 +106,6 @@ def test_cli_stream(testdir):
                 "csv",
                 "--output",
                 outfile,
-                "stream",
                 infile,
             ],
         )
@@ -110,6 +122,7 @@ def test_cli_parallel(testdir):
         result = runner.invoke(
             cli,
             [
+                "lattice",
                 "--parallel",
                 "--pages",
                 "1,2,3",
@@ -117,7 +130,6 @@ def test_cli_parallel(testdir):
                 "csv",
                 "--output",
                 outfile,
-                "lattice",
                 infile,
             ],
         )
@@ -131,18 +143,19 @@ def test_cli_hybrid(testdir):
         outfile = os.path.join(tempdir, "budget.csv")
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["--format", "csv", "--output", outfile, "hybrid", infile]
+            cli, ["hybrid", "--format", "csv", "--output", outfile, infile]
         )
         assert result.exit_code == 0
         assert result.output == "Found 1 tables\n"
 
-        result = runner.invoke(cli, ["--format", "csv", "hybrid", infile])
+        result = runner.invoke(cli, ["hybrid", "--format", "csv", infile])
         output_error = "Error: Please specify output file path using --output"
         assert output_error in result.output
 
-        result = runner.invoke(cli, ["--output", outfile, "hybrid", infile])
-        format_error = "Please specify output file format using --format"
-        assert format_error in result.output
+        # #639: --format inferred from .csv extension when --output is given.
+        result = runner.invoke(cli, ["hybrid", "--output", outfile, infile])
+        assert result.exit_code == 0, result.output
+        assert "Found 1 tables" in result.output
 
 
 def test_cli_network(testdir):
@@ -151,16 +164,17 @@ def test_cli_network(testdir):
         outfile = os.path.join(tempdir, "budget.csv")
         runner = CliRunner()
         result = runner.invoke(
-            cli, ["--format", "csv", "--output", outfile, "network", infile]
+            cli, ["network", "--format", "csv", "--output", outfile, infile]
         )
         assert result.exit_code == 0
         assert result.output == "Found 1 tables\n"
-        result = runner.invoke(cli, ["--format", "csv", "network", infile])
+        result = runner.invoke(cli, ["network", "--format", "csv", infile])
         output_error = "Error: Please specify output file path using --output"
         assert output_error in result.output
-        result = runner.invoke(cli, ["--output", outfile, "network", infile])
-        format_error = "Please specify output file format using --format"
-        assert format_error in result.output
+        # #639: --format inferred from .csv extension when --output is given.
+        result = runner.invoke(cli, ["network", "--output", outfile, infile])
+        assert result.exit_code == 0, result.output
+        assert "Found 1 tables" in result.output
 
 
 def test_cli_password(testdir):
@@ -171,13 +185,13 @@ def test_cli_password(testdir):
         result = runner.invoke(
             cli,
             [
+                "stream",
                 "--password",
                 "userpass",
                 "--format",
                 "csv",
                 "--output",
                 outfile,
-                "stream",
                 infile,
             ],
         )
@@ -187,7 +201,7 @@ def test_cli_password(testdir):
         output_error = "File has not been decrypted"
         # no password
         result = runner.invoke(
-            cli, ["--format", "csv", "--output", outfile, "stream", infile]
+            cli, ["stream", "--format", "csv", "--output", outfile, infile]
         )
         assert output_error in str(result.exception)
 
@@ -195,13 +209,13 @@ def test_cli_password(testdir):
         result = runner.invoke(
             cli,
             [
+                "stream",
                 "--password",
                 "wrongpass",
                 "--format",
                 "csv",
                 "--output",
                 outfile,
-                "stream",
                 infile,
             ],
         )
@@ -218,7 +232,7 @@ def test_cli_output_format(testdir):
         outfile = os.path.join(tempdir, "health.json")
         result = runner.invoke(
             cli,
-            ["--format", "json", "--output", outfile, "stream", infile],
+            ["stream", "--format", "json", "--output", outfile, infile],
         )
         assert result.exit_code == 0, f"Output: {result.output}"
 
@@ -226,7 +240,7 @@ def test_cli_output_format(testdir):
         outfile = os.path.join(tempdir, "health.xlsx")
         result = runner.invoke(
             cli,
-            ["--format", "excel", "--output", outfile, "stream", infile],
+            ["stream", "--format", "excel", "--output", outfile, infile],
         )
         assert result.exit_code == 0, f"Output: {result.output}"
 
@@ -234,7 +248,7 @@ def test_cli_output_format(testdir):
         outfile = os.path.join(tempdir, "health.html")
         result = runner.invoke(
             cli,
-            ["--format", "html", "--output", outfile, "stream", infile],
+            ["stream", "--format", "html", "--output", outfile, infile],
         )
         assert result.exit_code == 0, f"Output: {result.output}"
 
@@ -242,7 +256,7 @@ def test_cli_output_format(testdir):
         outfile = os.path.join(tempdir, "health.md")
         result = runner.invoke(
             cli,
-            ["--format", "markdown", "--output", outfile, "stream", infile],
+            ["stream", "--format", "markdown", "--output", outfile, infile],
         )
         assert result.exit_code == 0, f"Output: {result.output}"
 
@@ -251,12 +265,12 @@ def test_cli_output_format(testdir):
         result = runner.invoke(
             cli,
             [
+                "stream",
                 "--zip",
                 "--format",
                 "csv",
                 "--output",
                 outfile,
-                "stream",
                 infile,
             ],
         )
@@ -275,12 +289,12 @@ def test_cli_quiet(testdir):
                 result = runner.invoke(
                     cli,
                     [
+                        "stream",
                         "--quiet",
                         "--format",
                         "csv",
                         "--output",
                         outfile,
-                        "stream",
                         infile,
                     ],
                 )
@@ -296,11 +310,11 @@ def test_cli_lattice_plot_type():
         result = runner.invoke(
             cli,
             [
+                "lattice",
                 "--plot_type",
                 "contour",
                 "--output",
                 outfile,
-                "--format",
                 "--format",
                 "png",
             ],
@@ -314,3 +328,57 @@ def test_import_error():
             from camelot.cli import cli
         except ImportError:
             assert cli._HAS_MPL is False
+
+
+def test_version_package_not_found():
+    with mock.patch(
+        "importlib.metadata.version",
+        side_effect=importlib.metadata.PackageNotFoundError,
+    ):
+        from camelot.cli import get_version
+
+        assert get_version() is None
+
+
+@pytest.mark.parametrize("flavor", ["lattice", "stream", "network", "hybrid"])
+def test_cli_plot_without_matplotlib_raises(flavor, testdir, monkeypatch):
+    # When matplotlib isn't available, asking any flavor for a --plot_type
+    # must raise ImportError before parsing. Covers the
+    # `if not _HAS_MPL: raise ImportError` branch in each flavor command —
+    # no existing test reaches it, since matplotlib is installed in CI.
+    import camelot.cli
+
+    monkeypatch.setattr(camelot.cli, "_HAS_MPL", False)
+    infile = os.path.join(testdir, "foo.pdf")
+    runner = CliRunner()
+    result = runner.invoke(cli, [flavor, "--plot_type", "text", infile])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, ImportError)
+
+
+def test_config_set_config():
+    """Config.set_config stores values for the cli group's kwargs handoff (#614).
+
+    Direct unit test — the group accepts no options of its own today, so this
+    code path isn't exercised by the subcommand integration tests.
+    """
+    from camelot.cli import Config
+
+    c = Config()
+    c.set_config("flag", True)
+    c.set_config("name", "lattice")
+    assert c.config == {"flag": True, "name": "lattice"}
+
+
+def test_cli_group_help_invokes_config():
+    """The group callback wires ctx.obj to a Config instance (#614)."""
+    from click.testing import CliRunner
+
+    from camelot.cli import cli
+
+    runner = CliRunner()
+    # Invoke a real subcommand with --help so we hit the group's body
+    # (setting ctx.obj) but stop before requiring positional args.
+    result = runner.invoke(cli, ["lattice", "--help"])
+    assert result.exit_code == 0
+    assert "lattice" in result.output.lower()

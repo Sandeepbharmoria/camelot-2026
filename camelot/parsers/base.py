@@ -13,7 +13,7 @@ from ..utils import compute_accuracy
 from ..utils import compute_whitespace
 from ..utils import get_table_index
 from ..utils import text_in_bbox
-
+from ..utils import text_replace
 
 logger = logging.getLogger("camelot")
 
@@ -26,9 +26,12 @@ class BaseParser:
         parser_id,
         table_regions=None,
         table_areas=None,
+        header_text=None,
+        footer_text=None,
         copy_text=None,
         split_text=False,
         strip_text="",
+        replace_text=None,
         shift_text=None,
         flag_size=False,
         debug=False,
@@ -36,12 +39,16 @@ class BaseParser:
         self.id = parser_id
         self.table_regions = table_regions
         self.table_areas = table_areas
+        self.header_text = header_text
+        self.footer_text = footer_text
         self.table_bbox_parses = {}
 
         self.columns = None
         self.copy_text = copy_text
         self.split_text = split_text
         self.strip_text = strip_text
+        # See `read_pdf` docstring + #482. None / empty dict = no-op.
+        self.replace_text = replace_text or None
         self.shift_text = shift_text
 
         self.flag_size = flag_size
@@ -74,6 +81,7 @@ class BaseParser:
         images,
         horizontal_text,
         vertical_text,
+        rotation,
         layout_kwargs,
     ):
         """Prepare the page for parsing."""
@@ -85,6 +93,7 @@ class BaseParser:
         self.images = images
         self.horizontal_text = horizontal_text
         self.vertical_text = vertical_text
+        self.rotation = rotation
         self.pdf_width, self.pdf_height = self.dimensions
         self.rootname, __ = os.path.splitext(self.filename)
 
@@ -123,15 +132,14 @@ class BaseParser:
             Whether the document doesn't have any text at all.
         """
         if not self.horizontal_text:
-            rootname = os.path.basename(self.rootname)
             if self.images:
                 warnings.warn(
-                    f"{rootname} is image-based, "
+                    f"page-{self.page} is image-based, "
                     "camelot only works on text-based pages.",
                     stacklevel=1,
                 )
             else:
-                warnings.warn(f"No tables found on {rootname}", stacklevel=2)
+                warnings.warn(f"No tables found on page-{self.page}", stacklevel=2)
             return True
         return False
 
@@ -157,6 +165,7 @@ class BaseParser:
         table = Table(cols, rows)
         table.page = self.page
         table.order = table_idx + 1
+        table.rotation = self.rotation
         table._bbox = bbox
         return table
 
@@ -183,26 +192,53 @@ class BaseParser:
             Parse errors
         """
         pos_errors = []
-        # TODO: have a single list in place of two directional ones?
-        # sorted on x-coordinate based on reading order i.e. LTR or RTL
-        for direction in ["vertical", "horizontal"]:
-            for t in self.t_bbox[direction]:
-                indices, error = get_table_index(
-                    table,
-                    t,
-                    direction,
-                    split_text=self.split_text,
-                    flag_size=self.flag_size,
-                    strip_text=self.strip_text,
-                )
-                if len(indices) > 0:
-                    if indices[0][:2] != (-1, -1):
-                        pos_errors.append(error)
-                        indices = type(self)._reduce_index(
-                            table, indices, shift_text=self.shift_text
-                        )
-                        for r_idx, c_idx, text in indices:
-                            table.cells[r_idx][c_idx].text = text
+        # Process textlines from both orientations in a single global
+        # reading-order stream (-y0 top-first, then x0 left-first) rather
+        # than the previous vertical-pass-then-horizontal-pass loop.
+        #
+        # Cell.text is an *appending* setter, so the order textlines are
+        # visited determines the order their fragments concatenate in a
+        # cell. The old "all vertical, then all horizontal" order meant a
+        # glyph that playa happened to classify as a vertical textline
+        # (e.g. a lone single character split off from a word) was
+        # appended *before* the horizontal textlines of the same cell —
+        # floating it to the front of the cell text. Reported as #385
+        # ('d' of 'dihydroclorid' jumping to the start of the cell).
+        #
+        # Sorting both orientations together by reading order places each
+        # textline by its own position, so the cell accumulates
+        # top-to-bottom, left-to-right regardless of orientation tag.
+        textlines = [
+            (t, direction)
+            for direction in ("vertical", "horizontal")
+            for t in self.t_bbox[direction]
+        ]
+        textlines.sort(key=lambda td: (-td[0].y0, td[0].x0))
+        for t, direction in textlines:
+            indices, error = get_table_index(
+                table,
+                t,
+                direction,
+                split_text=self.split_text,
+                flag_size=self.flag_size,
+                strip_text=self.strip_text,
+            )
+            if len(indices) > 0:
+                if indices[0][:2] != (-1, -1):
+                    pos_errors.append(error)
+                    indices = type(self)._reduce_index(
+                        table, indices, shift_text=self.shift_text
+                    )
+                    for r_idx, c_idx, text in indices:
+                        # replace_text (#482) is applied after the
+                        # split/strip/flag-size pipeline, at the
+                        # last point before the text reaches the
+                        # output cell. Order: strip first (already
+                        # done upstream in get_table_index), then
+                        # replace, then assign.
+                        if self.replace_text:
+                            text = text_replace(text, self.replace_text)
+                        table.cells[r_idx][c_idx].text = text
         return pos_errors
 
     def _generate_columns_and_rows(self, bbox, user_cols):
@@ -217,6 +253,24 @@ class BaseParser:
         # Pure virtual, must be defined by the derived parser
         raise NotImplementedError()
 
+    def _reject_table(self, table) -> bool:
+        """Hook: return True to drop a freshly built table before it's kept.
+
+        Default keeps everything. Parsers override this to apply a
+        precision gate (e.g. Lattice drops mostly-empty ruled grids that
+        are detection noise rather than real tables).
+        """
+        return False
+
+    def _postprocess_tables(self, tables):
+        """Hook: transform the per-page table list before it's returned.
+
+        Default returns it unchanged. Parsers override this to apply
+        cross-table cleanups (e.g. Network suppresses nested/overlapping
+        duplicate detections of the same table).
+        """
+        return tables
+
     def extract_tables(self):
         """Extract tables from the document."""
         if self._document_has_no_text():
@@ -229,21 +283,32 @@ class BaseParser:
         _tables = []
         # sort tables based on y-coord
         for table_idx, bbox in enumerate(self.table_bboxes()):
-            if self.columns is not None and self.columns[table_idx] != "":
+            # Re-use the last user-supplied column spec when more tables are
+            # discovered than column specs were supplied (#112). The previous
+            # behaviour raised IndexError on the second extra table, which
+            # is the wrong failure mode when the columns are meant to apply
+            # to "however many tables match this layout".
+            if self.columns is not None and self.columns:
+                col_idx = table_idx if table_idx < len(self.columns) else -1
+                col_spec = self.columns[col_idx]
+            else:
+                col_spec = ""
+            if col_spec != "":
                 # user has to input boundary columns too
                 # take (0, pdf_width) by default
                 # similar to else condition
                 # len can't be 1
-                user_cols = self.columns[table_idx].split(",")
+                user_cols = col_spec.split(",")
                 user_cols = [float(c) for c in user_cols]
             else:
                 user_cols = None
 
             cols, rows, v_s, h_s = self._generate_columns_and_rows(bbox, user_cols)
             table = self._generate_table(table_idx, bbox, cols, rows, v_s=v_s, h_s=h_s)
-            _tables.append(table)
+            if not self._reject_table(table):
+                _tables.append(table)
 
-        return _tables
+        return self._postprocess_tables(_tables)
 
     def record_parse_metadata(self, table):
         """Record data about the origin of the table."""
@@ -289,9 +354,12 @@ class TextBaseParser(BaseParser):
         table_regions=None,
         table_areas=None,
         columns=None,
+        header_text=None,
+        footer_text=None,
         flag_size=False,
         split_text=False,
         strip_text="",
+        replace_text=None,
         edge_tol=50,
         row_tol=2,
         column_tol=0,
@@ -303,8 +371,11 @@ class TextBaseParser(BaseParser):
             parser_id,
             table_regions=table_regions,
             table_areas=table_areas,
+            header_text=header_text,
+            footer_text=footer_text,
             split_text=split_text,
             strip_text=strip_text,
+            replace_text=replace_text,
             flag_size=flag_size,
             debug=debug,
         )
@@ -485,7 +556,7 @@ class TextBaseParser(BaseParser):
     def _validate_columns(self):
         if self.table_areas is not None and self.columns is not None:
             if len(self.table_areas) != len(self.columns):
-                raise ValueError("Length of table_areas and columns" " should be equal")
+                raise ValueError("Length of table_areas and columns should be equal")
 
     def _generate_table(self, table_idx, bbox, cols, rows, **kwargs):
         table = self._initialize_new_table(table_idx, bbox, cols, rows)

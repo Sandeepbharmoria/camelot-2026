@@ -6,8 +6,8 @@ import math
 from typing import Any
 
 import numpy as np
-from pdfminer.layout import LTTextLineHorizontal
-from pdfminer.layout import LTTextLineVertical
+from playa.miner import LTTextLineHorizontal
+from playa.miner import LTTextLineVertical
 
 from ..core import ALL_ALIGNMENTS
 from ..core import HORIZONTAL_ALIGNMENTS
@@ -21,7 +21,6 @@ from ..utils import text_in_bbox
 from ..utils import text_in_bbox_per_axis
 from ..utils import textlines_overlapping_bbox
 from .base import TextBaseParser
-
 
 # maximum number of columns over which a header can spread
 MAX_COL_SPREAD_IN_HEADER = 3
@@ -90,7 +89,7 @@ def find_closest_tls(  # noqa: C901
     top: LTTextLineHorizontal | LTTextLineVertical | None = None
     bottom: LTTextLineHorizontal | LTTextLineVertical | None = None
 
-    (bbox_left, bbox_bottom, bbox_right, bbox_top) = bbox
+    bbox_left, bbox_bottom, bbox_right, bbox_top = bbox
 
     for textline in tls:
         if textline.x1 < bbox_left:
@@ -223,7 +222,7 @@ def search_header_from_body_bbox(
         The expanded bounding box in the format (left, bottom, right, top).
     """
     new_bbox = body_bbox
-    (left, bottom, right, top) = body_bbox
+    left, bottom, right, top = body_bbox
     zones: list[list[float]] = []
 
     keep_searching = True
@@ -257,7 +256,8 @@ def search_header_from_body_bbox(
             merged_zones = _merge_zones(zones)
 
             max_spread = max(
-                column_spread(zone[0], zone[1], col_anchors) for zone in merged_zones
+                (column_spread(zone[0], zone[1], col_anchors) for zone in merged_zones),
+                default=0,
             )
 
             # Accept textlines that cross columns boundaries, as long as they
@@ -478,7 +478,17 @@ class TextNetworks(TextAlignments):
         h_textlines = sorted(ref_h_textlines, key=lambda textline: textline.x0)
         v_textlines = sorted(ref_v_textlines, key=lambda textline: textline.y0)
 
-        # Calculate gaps between textlines
+        # Calculate gaps between textlines (left-edge-to-left-edge stride).
+        #
+        # NB(#770): do NOT naively change ``.x0 - .x0`` to ``.x0 - .x1``
+        # (whitespace gap) to fix #585. It was validated to fix #585 but
+        # regress 12 network/hybrid fixtures — every downstream gap
+        # consumer (the percentile logic below, the column-spread cutoffs
+        # in ``search_header_from_body_bbox``) is calibrated to *stride*
+        # values, so the swap under-splits columns elsewhere. The two
+        # xfailed #585 tests in ``tests/test_network.py`` document the
+        # limitation. A real fix needs a full gap-consumer re-tune — see
+        # #770 for the analysis.
         h_gaps = np.array(
             [
                 h_textlines[i].x0 - h_textlines[i - 1].x0
@@ -527,6 +537,9 @@ class TextNetworks(TextAlignments):
             [x0, y0, x1, y1] or None if not enough textlines are found.
         """
         most_aligned_tl = self.most_connected_textline()
+        if most_aligned_tl is None:
+            # No connected textlines — nothing to grow a body bbox from.
+            return None
         max_h_gap, max_v_gap = gaps_hv
 
         parse_details_search: dict[str, Any] | None = None
@@ -746,6 +759,29 @@ class TextNetworks(TextAlignments):
         self._compute_alignment_counts()
 
 
+#: Suppress a Network table whose bbox is at least this fraction covered by a
+#: larger detected table. The connectivity search sometimes emits a *partial*
+#: copy nested inside the full table (same columns, same top, fewer rows),
+#: which both inflates the table count (false positive) and mismatches row
+#: structure when matched against ground truth. (#35)
+_OVERLAP_SUPPRESS = 0.6
+
+
+def _bbox_area(bbox):
+    x1, y1, x2, y2 = bbox
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def _overlap_fraction(inner, outer):
+    """Fraction of ``inner``'s area that lies within ``outer`` (x1,y1,x2,y2)."""
+    ix1, iy1 = max(inner[0], outer[0]), max(inner[1], outer[1])
+    ix2, iy2 = min(inner[2], outer[2]), min(inner[3], outer[3])
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    area = _bbox_area(inner)
+    return (ix2 - ix1) * (iy2 - iy1) / area if area else 0.0
+
+
 class Network(TextBaseParser):
     """Network method looks for spaces between text to parse the table.
 
@@ -792,6 +828,7 @@ class Network(TextBaseParser):
         flag_size=False,
         split_text=False,
         strip_text="",
+        replace_text=None,
         edge_tol=None,
         row_tol=2,
         column_tol=0,
@@ -806,6 +843,7 @@ class Network(TextBaseParser):
             flag_size=flag_size,
             split_text=split_text,
             strip_text=strip_text,
+            replace_text=replace_text,
             edge_tol=edge_tol,
             row_tol=row_tol,
             column_tol=column_tol,
@@ -939,6 +977,27 @@ class Network(TextBaseParser):
         if self.table_areas is not None:
             return [bbox_from_str(area_str) for area_str in self.table_areas]
         return None
+
+    def _postprocess_tables(self, tables):
+        """Suppress nested/overlapping duplicate detections of one table.
+
+        Keeps the larger of any two tables whose smaller member is mostly
+        (>= ``_OVERLAP_SUPPRESS``) covered by it, preserving reading order.
+        """
+        if len(tables) < 2 or any(t._bbox is None for t in tables):
+            return tables
+        by_size = sorted(tables, key=lambda t: _bbox_area(t._bbox), reverse=True)
+        kept = []
+        for t in by_size:
+            if any(
+                _overlap_fraction(t._bbox, k._bbox) >= _OVERLAP_SUPPRESS for k in kept
+            ):
+                continue
+            kept.append(t)
+        if len(kept) == len(tables):
+            return tables
+        kept_ids = {id(t) for t in kept}
+        return [t for t in tables if id(t) in kept_ids]
 
     def _generate_columns_and_rows(self, bbox, user_cols):
         # select elements which lie within table_bbox

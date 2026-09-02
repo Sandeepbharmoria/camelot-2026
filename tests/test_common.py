@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 
@@ -15,13 +16,33 @@ from .conftest import skip_pdftopng
 from .data import *
 
 
+def _processing_page_messages(caplog):
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "camelot"
+        and record.levelno == logging.INFO
+        and record.getMessage().startswith("Processing page ")
+    ]
+
+
 @skip_on_windows
 def test_parsing_report(testdir):
-    parsing_report = {"accuracy": 99.02, "whitespace": 12.24, "order": 1, "page": 1}
+    # #659: parsing_report also now includes a 'confidence' composite in
+    # [0, 1] computed from accuracy + whitespace. The other keys are
+    # unchanged; this test keeps pinning those values and adds the
+    # derived 'confidence' alongside.
+    expected = {
+        "accuracy": 99.02,
+        "whitespace": 12.24,
+        "order": 1,
+        "page": 1,
+        "confidence": round((99.02 / 100.0) * (1.0 - 12.24 / 100.0), 4),
+    }
 
     filename = os.path.join(testdir, "foo.pdf")
     tables = camelot.read_pdf(filename)
-    assert tables[0].parsing_report == parsing_report
+    assert tables[0].parsing_report == expected
 
 
 def test_password(testdir):
@@ -38,7 +59,11 @@ def test_password(testdir):
 def test_repr_pdfium(testdir):
     filename = os.path.join(testdir, "foo.pdf")
     tables = camelot.read_pdf(
-        filename, flavor="lattice", backend="pdfium", use_fallback=False
+        filename,
+        flavor="lattice",
+        backend="pdfium",
+        use_fallback=False,
+        engine="raster",
     )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
@@ -48,7 +73,7 @@ def test_repr_pdfium(testdir):
 @skip_pdftopng
 def test_repr_poppler(testdir):
     filename = os.path.join(testdir, "foo.pdf")
-    tables = camelot.read_pdf(filename, backend="poppler")
+    tables = camelot.read_pdf(filename, backend="poppler", engine="raster")
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=219 x2=165 y2=234>"
@@ -57,7 +82,7 @@ def test_repr_poppler(testdir):
 @skip_on_windows
 def test_repr_ghostscript(testdir):
     filename = os.path.join(testdir, "foo.pdf")
-    tables = camelot.read_pdf(filename, backend="ghostscript")
+    tables = camelot.read_pdf(filename, backend="ghostscript", engine="raster")
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
@@ -66,16 +91,16 @@ def test_repr_ghostscript(testdir):
 @skip_on_windows
 def test_repr_ghostscript_custom_backend(testdir):
     filename = os.path.join(testdir, "foo.pdf")
-    tables = camelot.read_pdf(filename, backend=GhostscriptBackend())
+    tables = camelot.read_pdf(filename, backend=GhostscriptBackend(), engine="raster")
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
 
 
 def test_url_pdfium():
-    url = "https://camelot-py.readthedocs.io/en/master/_static/pdf/foo.pdf"
+    url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
     tables = camelot.read_pdf(
-        url, flavor="lattice", backend="pdfium", use_fallback=False
+        url, flavor="lattice", backend="pdfium", use_fallback=False, engine="raster"
     )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
@@ -85,7 +110,7 @@ def test_url_pdfium():
 @skip_pdftopng
 def test_url_poppler():
     url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
-    tables = camelot.read_pdf(url, backend="poppler")
+    tables = camelot.read_pdf(url, backend="poppler", engine="raster")
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=219 x2=165 y2=234>"
@@ -94,7 +119,7 @@ def test_url_poppler():
 @skip_on_windows
 def test_url_ghostscript(testdir):
     url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
-    tables = camelot.read_pdf(url, backend="ghostscript")
+    tables = camelot.read_pdf(url, backend="ghostscript", engine="raster")
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
@@ -103,25 +128,31 @@ def test_url_ghostscript(testdir):
 @skip_on_windows
 def test_url_ghostscript_custom_backend(testdir):
     url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
-    tables = camelot.read_pdf(url, backend=GhostscriptBackend())
+    tables = camelot.read_pdf(url, backend=GhostscriptBackend(), engine="raster")
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
 
 
 def test_pages_pdfium():
-    url = "https://camelot-py.readthedocs.io/en/master/_static/pdf/foo.pdf"
-    tables = camelot.read_pdf(url, backend="pdfium", use_fallback=False)
+    url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
+    tables = camelot.read_pdf(
+        url, backend="pdfium", use_fallback=False, engine="raster"
+    )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=121 y1=218 x2=165 y2=234>"
 
-    tables = camelot.read_pdf(url, pages="1-end", backend="pdfium", use_fallback=False)
+    tables = camelot.read_pdf(
+        url, pages="1-end", backend="pdfium", use_fallback=False, engine="raster"
+    )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=121 y1=218 x2=165 y2=234>"
 
-    tables = camelot.read_pdf(url, pages="all", backend="pdfium", use_fallback=False)
+    tables = camelot.read_pdf(
+        url, pages="all", backend="pdfium", use_fallback=False, engine="raster"
+    )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=121 y1=218 x2=165 y2=234>"
@@ -130,17 +161,23 @@ def test_pages_pdfium():
 @skip_pdftopng
 def test_pages_poppler():
     url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
-    tables = camelot.read_pdf(url, backend="poppler", use_fallback=False)
+    tables = camelot.read_pdf(
+        url, backend="poppler", use_fallback=False, engine="raster"
+    )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=219 x2=165 y2=234>"
 
-    tables = camelot.read_pdf(url, pages="1-end", backend="poppler", use_fallback=False)
+    tables = camelot.read_pdf(
+        url, pages="1-end", backend="poppler", use_fallback=False, engine="raster"
+    )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=219 x2=165 y2=234>"
 
-    tables = camelot.read_pdf(url, pages="all", backend="poppler", use_fallback=False)
+    tables = camelot.read_pdf(
+        url, pages="all", backend="poppler", use_fallback=False, engine="raster"
+    )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=219 x2=165 y2=234>"
@@ -149,20 +186,22 @@ def test_pages_poppler():
 @skip_on_windows
 def test_pages_ghostscript():
     url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
-    tables = camelot.read_pdf(url, backend="ghostscript", use_fallback=False)
-    assert repr(tables) == "<TableList n=1>"
-    assert repr(tables[0]) == "<Table shape=(7, 7)>"
-    assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
-
     tables = camelot.read_pdf(
-        url, pages="1-end", backend="ghostscript", use_fallback=False
+        url, backend="ghostscript", use_fallback=False, engine="raster"
     )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
 
     tables = camelot.read_pdf(
-        url, pages="all", backend="ghostscript", use_fallback=False
+        url, pages="1-end", backend="ghostscript", use_fallback=False, engine="raster"
+    )
+    assert repr(tables) == "<TableList n=1>"
+    assert repr(tables[0]) == "<Table shape=(7, 7)>"
+    assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
+
+    tables = camelot.read_pdf(
+        url, pages="all", backend="ghostscript", use_fallback=False, engine="raster"
     )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
@@ -173,24 +212,68 @@ def test_pages_ghostscript():
 def test_pages_ghostscript_custom_backend():
     url = "https://camelot-py.readthedocs.io/en/latest/_static/pdf/foo.pdf"
     custom_backend = GhostscriptBackend()
-    tables = camelot.read_pdf(url, backend=custom_backend, use_fallback=False)
-    assert repr(tables) == "<TableList n=1>"
-    assert repr(tables[0]) == "<Table shape=(7, 7)>"
-    assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
-
     tables = camelot.read_pdf(
-        url, pages="1-end", backend=custom_backend, use_fallback=False
+        url, backend=custom_backend, use_fallback=False, engine="raster"
     )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
 
     tables = camelot.read_pdf(
-        url, pages="all", backend=custom_backend, use_fallback=False
+        url, pages="1-end", backend=custom_backend, use_fallback=False, engine="raster"
     )
     assert repr(tables) == "<TableList n=1>"
     assert repr(tables[0]) == "<Table shape=(7, 7)>"
     assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
+
+    tables = camelot.read_pdf(
+        url, pages="all", backend=custom_backend, use_fallback=False, engine="raster"
+    )
+    assert repr(tables) == "<TableList n=1>"
+    assert repr(tables[0]) == "<Table shape=(7, 7)>"
+    assert repr(tables[0].cells[0][0]) == "<Cell x1=120 y1=218 x2=165 y2=234>"
+
+
+def test_read_pdf_logs_processing_progress_per_page(testdir, caplog):
+    filename = os.path.join(testdir, "hybrid_multipage.pdf")
+    caplog.set_level(logging.INFO, logger="camelot")
+
+    camelot.read_pdf(filename, pages="1-2")
+
+    assert _processing_page_messages(caplog) == [
+        "Processing page 1",
+        "Processing page 2",
+    ]
+
+
+def test_read_pdf_suppresses_processing_progress(testdir, caplog):
+    filename = os.path.join(testdir, "hybrid_multipage.pdf")
+    caplog.set_level(logging.INFO, logger="camelot")
+
+    camelot.read_pdf(filename, pages="1-2", suppress_stdout=True)
+
+    assert _processing_page_messages(caplog) == []
+
+
+def test_read_pdf_logs_processing_progress_for_page_subset(testdir, caplog):
+    filename = os.path.join(testdir, "vertical_header.pdf")
+    caplog.set_level(logging.INFO, logger="camelot")
+
+    camelot.read_pdf(filename, pages="1,3", flavor="stream")
+
+    assert _processing_page_messages(caplog) == [
+        "Processing page 1",
+        "Processing page 3",
+    ]
+
+
+def test_read_pdf_logs_processing_progress_for_single_page(testdir, caplog):
+    filename = os.path.join(testdir, "foo.pdf")
+    caplog.set_level(logging.INFO, logger="camelot")
+
+    camelot.read_pdf(filename)
+
+    assert _processing_page_messages(caplog) == ["Processing page 1"]
 
 
 def test_table_order():
@@ -243,20 +326,10 @@ def test_handler_pages_generator(testdir):
     assert handler._get_pages("all") == [1]
 
 
-def test_handler_with_stream(testdir):
-    filename = os.path.join(testdir, "foo.pdf")
-
-    with open(filename, "rb") as f:
-        handler = PDFHandler(f)
-        assert handler._get_pages("1") == [1]
-
-
 def test_handler_with_pathlib(testdir):
     filename = Path(os.path.join(testdir, "foo.pdf"))
-
-    with open(filename, "rb") as f:
-        handler = PDFHandler(f)
-        assert handler._get_pages("1") == [1]
+    handler = PDFHandler(filename)
+    assert handler._get_pages("1") == [1]
 
 
 def test_table_list_iter():
@@ -283,3 +356,130 @@ def test_table_list_iter():
     assert iterator_b is not None
     item_c = next(iterator_b)
     assert item_c is not None
+
+
+def test_tablelist_accepts_iterable():
+    """Accept any Iterable[Table] for TableList — not just Sized (#655)."""
+    from unittest.mock import MagicMock
+
+    # Empty generator: bool / len must work without consuming-issues.
+    empty = TableList(t for t in [])
+    assert len(empty) == 0
+    assert bool(empty) is False
+
+    # Non-empty generator: previously raised TypeError on len/bool. Use
+    # MagicMock(spec=Table) so the typeguard session is happy with
+    # __getitem__'s `-> Table` annotation; plain `object()` would trip
+    # `typeguard.TypeCheckError: the return value (object) is not an
+    # instance of camelot.core.Table`.
+    sentinels = [MagicMock(spec=Table), MagicMock(spec=Table)]
+    tl = TableList(iter(sentinels))
+    assert len(tl) == 2
+    assert bool(tl) is True
+    assert tl[0] is sentinels[0]
+    assert tl[1] is sentinels[1]
+
+
+def test_parsing_report_includes_confidence():
+    """parsing_report now includes a unified 'confidence' composite in [0, 1] (#659)."""
+    import math
+
+    from camelot.core import Table
+
+    t = Table([(0.0, 100.0), (100.0, 200.0)], [(100.0, 90.0), (90.0, 80.0)])
+    t.accuracy = 90.0
+    t.whitespace = 10.0
+    t.order = 1
+    t.page = 1
+
+    report = t.parsing_report
+    # Schema: legacy keys still there, new key added.
+    assert {"page", "order", "accuracy", "whitespace", "confidence"} == set(report)
+    assert math.isclose(report["confidence"], 0.81, abs_tol=1e-4)
+    assert 0.0 <= report["confidence"] <= 1.0
+
+    # Edge cases.
+    t.accuracy, t.whitespace = 100.0, 0.0
+    assert math.isclose(t.confidence, 1.0)
+    t.accuracy, t.whitespace = 0.0, 50.0
+    assert t.confidence == 0.0
+    t.accuracy, t.whitespace = 100.0, 100.0
+    assert t.confidence == 0.0
+
+
+def test_auto_flavor_warns_and_extracts(testdir):
+    """flavor='auto' picks one of the supported flavors, warns, and parses."""
+    import re
+    import warnings
+
+    import camelot
+
+    filename = os.path.join(testdir, "foo.pdf")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        tables = camelot.read_pdf(filename, flavor="auto")
+    # The auto-detection warning must fire with one of the supported flavor
+    # names. We deliberately don't pin which one — the heuristic depends on
+    # the rendered-image line-detection sensitivity, which varies slightly
+    # across cv2/Pillow builds. What matters is that auto returned a real
+    # flavor (not 'auto' echoed back), the warning fired, and the parse
+    # produced at least one table on foo.pdf.
+    auto_warns = [w for w in caught if "auto-detected" in str(w.message)]
+    assert auto_warns, f"expected an auto-detection UserWarning, got: {caught!r}"
+    msg = str(auto_warns[-1].message)
+    # auto now reports its choice(s) per page, e.g.
+    # "auto-detected per-page flavors {1: 'lattice'}".
+    flavors = set(re.findall(r"'(lattice|stream|network|hybrid)'", msg))
+    assert flavors, f"unexpected warning text: {msg!r}"
+    assert flavors <= {"lattice", "stream", "network", "hybrid"}
+    assert len(tables) >= 1
+
+
+def test_auto_flavor_rejects_unknown():
+    """flavor='unknown' still raises NotImplementedError with the new value listed."""
+    import pytest
+
+    import camelot
+
+    with pytest.raises(NotImplementedError, match=r"auto"):
+        camelot.read_pdf("nonexistent.pdf", flavor="banana")
+
+
+def test_overlapping_text_preserves_adjacent_cell(testdir):
+    """Adjacent-cell text isn't dropped when a wide neighbour overlaps it (#288, #625).
+
+    issue_288.pdf has rows where a long company name ("Ackermann …
+    XXXXXXXXXXXXXXXXXX GmbH") physically extends past its column into
+    the neighbouring Vers.-Nummer cell. The old text_in_bbox dedup —
+    geometry-only, no content check — discarded the Vers.-Nummer
+    textlines as "duplicates" of the longer Name textline. The
+    content-aware fix keeps them, because a numeric Vers.-Nummer string
+    is not equal to the company name.
+
+    The assertion is on data preservation, not exact column placement:
+    stream's column inference can merge cells when wide and narrow
+    textlines coexist at the same Y, so the Vers.-Nummer may land in
+    the Name cell as a wrapped line. The important user-visible point
+    is that the number is no longer silently dropped from the output.
+    """
+    import re
+
+    filename = os.path.join(testdir, "issue_288.pdf")
+    tables = camelot.read_pdf(filename, flavor="stream", suppress_stdout=True)
+    df = tables[0].df
+
+    # Vers.-Nummer strings follow the "DD DDDDDDDDD" pattern in this PDF.
+    vers_nr_re = re.compile(r"\b\d{2}\s\d{9}\b")
+    ackermann_mask = df.apply(
+        lambda row: row.astype(str).str.contains("Ackermann", regex=False).any(),
+        axis=1,
+    )
+    ackermann_rows = df[ackermann_mask]
+    assert len(ackermann_rows) >= 1, "fixture changed: no Ackermann rows found"
+
+    for idx, row in ackermann_rows.iterrows():
+        row_text = " ".join(row.astype(str).tolist())
+        assert vers_nr_re.search(row_text), (
+            f"row {idx} ({row_text[:60]!r}…) is missing its Vers.-Nummer — "
+            "text_in_bbox content-aware dedup regressed."
+        )

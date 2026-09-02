@@ -1,38 +1,33 @@
 [project]
 name = "camelot-py"
-version = "1.0.9"
+version = "2.0.0"
 description = "PDF Table Extraction for Humans."
 authors = [
     {name = "Vinayak Mehta", email = "vmehta94@gmail.com"},
 ]
-license = "MIT"
+license = {text = "MIT"}
 readme = "README.md"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
     "click>=8.0.1",
-    "chardet>=5.1.0",
-    "numpy>=1.24.4; python_version < '3.12'",
-    "numpy>=1.26.1; python_version >= '3.12'",
+    "numpy>=1.26.1",
     "openpyxl>=3.1.0",
-    "pdfminer-six>=20240706",
-    "pypdf>=3.17,<4.0; python_version < '3.12'",
-    "pypdf>=4.0,<6.0; python_version >= '3.12'",
-    "pandas>=1.5.3; python_version < '3.10'",
-    "pandas>=2.2.2; python_version >= '3.10'",
+    "pandas>=2.2.2",
     "tabulate>=0.9.0",
     "typing-extensions>=4.12.2; python_version < '3.11'",
     "opencv-python-headless>=4.7.0.68",
     "pypdfium2>=4",
     "pillow>=10.4.0",
+    "playa-pdf>=0.8.1",
 ]
 
 [build-system]
@@ -55,26 +50,38 @@ plot = [
     "matplotlib>=3.7.5; python_version < '3.12'",
     "matplotlib>=3.8.0; python_version >= '3.12'",
 ]
+# Optional neural backend for flavor='ml' (Table Transformer / TATR via
+# HuggingFace transformers). Heavy (pulls torch); opt in explicitly with
+# `pip install 'camelot-py[ml]'`. Imported lazily so the core install and
+# the other flavors never load torch.
+ml = [
+    "torch>=2.0",
+    # <5: transformers v5 strict-validates configs and rejects the TATR
+    # checkpoints (published for v4, e.g. `dilation: None`). The whole TATR
+    # ecosystem pins to v4; revisit when the checkpoints are v5-clean.
+    "transformers>=4.40,<6",
+    "timm>=0.9",
+    "pillow>=10.4.0",
+]
+# Optional OCR text source for flavor='ml' on scanned / image-only PDFs
+# (structure still from TATR; text from OCR instead of the PDF text layer).
+# Pip-only, no system tesseract binary. `pip install 'camelot-py[ocr]'`.
+ocr = [
+    "rapidocr-onnxruntime>=1.3",
+]
 ghostscript = [
     "ghostscript>=0.7",
 ]
 dev = [
     "Pygments>=2.10.0",
-    "black>=23.1.0",
     "coverage[toml]>=6.2",
-    "flake8>=4.0.1",
-    "flake8-bandit>=2.1.2",
-    "flake8-bugbear>=21.9.2",
-    "flake8-rst-docstrings>=0.2.5",
+    "ruff>=0.12.10",
     "sphinx-book-theme>=1.0.1",
-    "isort>=5.10.1",
     "mypy>=0.930",
-    "pep8-naming>=0.12.1",
     "pre-commit>=2.16.0",
     "pre-commit-hooks>=4.1.0",
     "pytest>=6.2.5",
     "pytest-mpl>=0.17.0",
-    "pyupgrade>=2.29.1",
     "safety>=2.2.3",
     "sphinx>=4.3.2",
     "sphinx-autobuild>=2021.3.14",
@@ -91,6 +98,9 @@ dev = [
 
 [project.scripts]
 camelot = "camelot.__main__:main"
+# Alias matching the PyPI package name so `uvx camelot-py …` works without
+# the `--from camelot-py` prefix. See #639.
+camelot-py = "camelot.__main__:main"
 
 [tool.coverage.paths]
 source = ["camelot", "*\\camelot", "*/site-packages"]
@@ -104,10 +114,68 @@ source = ["camelot", "tests"]
 show_missing = true
 fail_under = 90
 
-[tool.isort]
-profile = "black"
-force_single_line = true
-lines_after_imports = 2
+[tool.ruff]
+# Ruff replaces Black (formatter) and isort (import sorting). Match
+# `requires-python = ">=3.10"` so the formatter targets the floor version
+# (also keeps formatting stable across the 3.10–3.15 CI matrix).
+target-version = "py310"
+line-length = 88  # Black's default, which the codebase was formatted to.
+# Notebooks were never linted/formatted by the old black/flake8 (types: [python]);
+# keep that behaviour. Vendored Flask theme is third-party.
+extend-exclude = ["*.ipynb", "docs/_themes/*"]
+# pre-commit passes file paths explicitly; force-exclude makes Ruff honour
+# the excludes above even then (otherwise excluded files still get linted).
+force-exclude = true
+
+[tool.ruff.lint]
+# Ruff replaces flake8 + its plugins + isort + pyupgrade. Mapping of the
+# old `.flake8` select (B,B9,C,D,DAR,E,F,N,RST,S,W):
+#   B   -> flake8-bugbear        S   -> flake8-bandit
+#   C   -> mccabe (C90)          W/E -> pycodestyle
+#   D   -> pydocstyle            F   -> pyflakes
+#   N   -> pep8-naming           I   -> isort (was a separate tool)
+#   UP  -> pyupgrade (was a separate hook)
+# Not ported: RST (flake8-rst-docstrings) and DAR (darglint) have no Ruff
+# equivalent. DAR was inert (darglint wasn't installed); RST docstring
+# linting is dropped — the one capability lost in the move.
+select = ["B", "C90", "D", "E", "F", "I", "N", "S", "UP", "W"]
+ignore = [
+    "D401", # imperative-mood first line (was ignored under flake8)
+    "E203", # whitespace before ':' — Ruff-format/Black compatibility
+    "E501", # line too long — the formatter owns wrapping
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.isort]
+# Mirror the previous `isort` config (profile = "black", one import per line).
+force-single-line = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D200",
+    "D401",
+    "S101",
+    "S106",
+    "F403",
+    "F405",
+    "F841",
+]
+"__init__.py" = ["D100", "D103", "D104", "F401"]
+"__version__.py" = ["D100"]
+"__main__.py" = ["D100", "D103"]
+# Benchmark scripts are dev-only (not shipped); docstrings optional and some
+# deliberately copy legacy complex code for apples-to-apples timing.
+"bench/*" = ["C901", "D100", "D101", "D102", "D103", "S101"]
 
 [tool.mypy]
 warn_unreachable = true

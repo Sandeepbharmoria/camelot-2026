@@ -11,11 +11,12 @@ import shutil
 import string
 import tempfile
 import warnings
+from bisect import bisect_left
+from collections.abc import Callable
 from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
 from typing import Any
-from typing import Callable
 from urllib.parse import urlparse as parse_url
 from urllib.parse import uses_netloc
 from urllib.parse import uses_params
@@ -24,24 +25,16 @@ from urllib.request import Request
 from urllib.request import urlopen
 
 import numpy as np
-from pdfminer.converter import PDFPageAggregator
-from pdfminer.layout import LAParams
-from pdfminer.layout import LTAnno
-from pdfminer.layout import LTChar
-from pdfminer.layout import LTContainer
-from pdfminer.layout import LTImage
-from pdfminer.layout import LTItem
-from pdfminer.layout import LTTextLine
-from pdfminer.layout import LTTextLineHorizontal
-from pdfminer.layout import LTTextLineVertical
-from pdfminer.pdfdocument import PDFDocument
-from pdfminer.pdfinterp import PDFPageInterpreter
-from pdfminer.pdfinterp import PDFResourceManager
-from pdfminer.pdfpage import PDFPage
-from pdfminer.pdfpage import PDFTextExtractionNotAllowed
-from pdfminer.pdfparser import PDFParser
-from pypdf._utils import StrByteType
-
+import playa.miner as pm
+from playa.miner import LAParams
+from playa.miner import LTAnno
+from playa.miner import LTChar
+from playa.miner import LTContainer
+from playa.miner import LTImage
+from playa.miner import LTItem
+from playa.miner import LTTextLine
+from playa.miner import LTTextLineHorizontal
+from playa.miner import LTTextLineVertical
 
 _VALID_URLS = set(uses_relative + uses_netloc + uses_params)
 _VALID_URLS.discard("")
@@ -67,8 +60,13 @@ def is_url(url):
         return False
 
 
+_RANDOM_STRING_ALPHABET = (
+    string.digits + string.ascii_lowercase + string.ascii_uppercase
+)
+
+
 def random_string(length):
-    """Generate a random string .
+    """Generate a random string.
 
     Parameters
     ----------
@@ -80,16 +78,13 @@ def random_string(length):
     string
         returns a random string
     """
-    ret = ""
-    while length:
-        ret += random.choice(  # noqa S311
-            string.digits + string.ascii_lowercase + string.ascii_uppercase
-        )
-        length -= 1
-    return ret
+    # Single random.choices + str.join is several times faster than the old
+    # per-char loop with string concatenation and rebuilds the alphabet
+    # once at import time instead of on every call.
+    return "".join(random.choices(_RANDOM_STRING_ALPHABET, k=length))  # noqa S311
 
 
-def download_url(url: str) -> StrByteType | Path:
+def download_url(url: str) -> str | Path:
     """Download file from specified URL.
 
     Parameters
@@ -98,7 +93,7 @@ def download_url(url: str) -> StrByteType | Path:
 
     Returns
     -------
-    filepath : Union[StrByteType, Path]
+    filepath : Union[str, Path]
         Temporary filepath.
 
     """
@@ -109,8 +104,8 @@ def download_url(url: str) -> StrByteType | Path:
             "User-Agent": "Mozilla/5.0",
             "Accept-Encoding": "gzip;q=1.0, deflate;q=0.9, br;q=0.8, compress;q=0.7, *;q=0.1",
         }
-        request = Request(url, None, headers)
-        obj = urlopen(request)  # noqa S310
+        request = Request(url, None, headers)  # noqa: S310 - documented URL feature
+        obj = urlopen(request)  # noqa: S310 - user-supplied PDF URL; documented feature
         content_type = obj.info().get_content_type()
         if content_type != "application/pdf":
             raise NotImplementedError("File format not supported")
@@ -123,13 +118,21 @@ def download_url(url: str) -> StrByteType | Path:
 common_kwargs = [
     "flag_size",
     "margins",
+    "replace_text",
     "split_text",
     "strip_text",
     "table_areas",
     "table_regions",
     "backend",
 ]
-text_kwargs = common_kwargs + ["columns", "edge_tol", "row_tol", "column_tol"]
+text_kwargs = common_kwargs + [
+    "columns",
+    "header_text",
+    "footer_text",
+    "edge_tol",
+    "row_tol",
+    "column_tol",
+]
 lattice_kwargs = common_kwargs + [
     "process_background",
     "line_scale",
@@ -140,14 +143,33 @@ lattice_kwargs = common_kwargs + [
     "threshold_blocksize",
     "threshold_constant",
     "iterations",
+    "erode_iterations",
     "resolution",
     "use_fallback",
+    "engine",
+]
+# The ML parser (flavor='ml', optional [ml] extra) gets its structure from a
+# neural model, so it shares the common text-handling kwargs (split/strip/flag/
+# regions/areas) + the spanning-text controls, plus a few model-specific knobs.
+ml_kwargs = common_kwargs + [
+    "copy_text",
+    "shift_text",
+    "resolution",
+    "use_fallback",
+    "device",
+    "structure_model",
+    "detection_model",
+    "detection_threshold",
+    "structure_threshold",
+    "crop_padding",
+    "ocr",
 ]
 flavor_to_kwargs = {
     "stream": text_kwargs,
     "network": text_kwargs,
     "lattice": lattice_kwargs,
     "hybrid": text_kwargs + lattice_kwargs,
+    "ml": ml_kwargs,
 }
 
 
@@ -231,7 +253,6 @@ class TemporaryDirectory:
         traceback : [type]
             [description]
         """
-        pass
 
 
 def build_file_path_in_temp_dir(filename, extension=None):
@@ -498,13 +519,104 @@ def bbox_from_str(bbox_str):
     bbox : tuple
         Tuple (x1, y1, x2, y2).
 
+    Raises
+    ------
+    ValueError
+        If the string isn't four numbers, or describes a zero-area box.
+        The latter is the usual cause of the otherwise cryptic
+        ``ZeroDivisionError`` downstream (#63), commonly because the
+        coordinates came from a top-left-origin tool — PDF space has its
+        origin at the bottom-left, so ``y1`` must be greater than ``y2``.
+
     """
-    x1, y1, x2, y2 = bbox_str.split(",")
-    x1 = float(x1)
-    y1 = float(y1)
-    x2 = float(x2)
-    y2 = float(y2)
+    parts = bbox_str.split(",")
+    if len(parts) != 4:
+        raise ValueError(
+            f"Invalid table area/region {bbox_str!r}: expected four "
+            "comma-separated numbers in the form 'x1,y1,x2,y2'."
+        )
+    try:
+        x1, y1, x2, y2 = (float(p) for p in parts)
+    except ValueError:
+        raise ValueError(
+            f"Invalid table area/region {bbox_str!r}: coordinates must be "
+            "numbers, in the form 'x1,y1,x2,y2'."
+        ) from None
+    if x1 == x2 or y1 == y2:
+        raise ValueError(
+            f"Invalid table area/region {bbox_str!r}: it has zero width or "
+            "height. Use 'x1,y1,x2,y2' where (x1, y1) is the top-left and "
+            "(x2, y2) the bottom-right corner in PDF coordinate space — the "
+            "origin is the bottom-left of the page, so y1 must be greater "
+            "than y2."
+        )
     return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+
+def image_bbox_to_pdf(bbox, image_size, pdf_size, as_string=False):
+    """Convert an image-space bbox to a PDF-space table area.
+
+    Parameters
+    ----------
+    bbox : tuple
+        Tuple (x1, y1, x2, y2) in image-pixel space, where the origin is the
+        top-left corner of the image.
+    image_size : tuple
+        Tuple (img_w, img_h) containing the rendered image width and height in
+        pixels.
+    pdf_size : tuple
+        Tuple (pdf_w, pdf_h) containing the PDF page width and height in
+        points.
+    as_string : bool, optional
+        If True, return the converted bbox as "x1,y1,x2,y2", suitable for use
+        as an entry in ``table_areas``. The default is False.
+
+    Returns
+    -------
+    bbox : tuple or str
+        Tuple (x1, y1, x2, y2) in PDF coordinate space, where the origin is the
+        bottom-left corner and y1 is greater than y2, or the same coordinates
+        serialized as "x1,y1,x2,y2" when ``as_string`` is True.
+
+    Raises
+    ------
+    ValueError
+        If an image or PDF dimension is zero or negative, or if ``bbox`` has
+        zero width or height in image-pixel space.
+
+    """
+    x1, y1, x2, y2 = bbox
+    img_w, img_h = image_size
+    pdf_w, pdf_h = pdf_size
+
+    if img_w <= 0 or img_h <= 0:
+        raise ValueError(
+            "image_size dimensions must be positive; pass the rendered image "
+            "size as (img_w, img_h)."
+        )
+    if pdf_w <= 0 or pdf_h <= 0:
+        raise ValueError(
+            "pdf_size dimensions must be positive; pass the PDF page size in "
+            "points as (pdf_w, pdf_h)."
+        )
+    if x1 == x2 or y1 == y2:
+        raise ValueError(
+            "bbox must have non-zero width and height in image-pixel space; "
+            "pass (x1, y1, x2, y2) from the rendered image."
+        )
+
+    scaling_factor_x = pdf_w / img_w
+    scaling_factor_y = pdf_h / img_h
+
+    left = scale(min(x1, x2), scaling_factor_x)
+    right = scale(max(x1, x2), scaling_factor_x)
+    top = translate(-scale(min(y1, y2), scaling_factor_y), pdf_h)
+    bottom = translate(-scale(max(y1, y2), scaling_factor_y), pdf_h)
+
+    pdf_bbox = (left, top, right, bottom)
+    if as_string:
+        return ",".join(str(coord) for coord in pdf_bbox)
+    return pdf_bbox
 
 
 def bboxes_overlap(bbox1, bbox2):
@@ -526,8 +638,8 @@ def bboxes_overlap(bbox1, bbox2):
     bool
         Returns True if two bounding boxes overlap
     """
-    (left1, bottom1, right1, top1) = bbox1
-    (left2, bottom2, right2, top2) = bbox2
+    left1, bottom1, right1, top1 = bbox1
+    left2, bottom2, right2, top2 = bbox2
     return ((left1 < left2 < right1) or (left1 < right2 < right1)) and (
         (bottom1 < bottom2 < top1) or (bottom1 < top2 < top1)
     )
@@ -554,11 +666,83 @@ def textlines_overlapping_bbox(bbox, textlines):
     return t_bbox
 
 
+# Threshold above which the NumPy NxN intersection matrix in text_in_bbox
+# would use too much memory. n=600 needs ~3MB (float64); n=2000 ~32MB.
+# For larger inputs we fall back to the Python loop.
+_TEXT_IN_BBOX_NUMPY_MAX = 1500
+
+
+def _normalised_textline_text(t) -> str:
+    """Whitespace-stripped text of a PDFMiner-style textline (#288, #625).
+
+    Returns ``""`` if the textline has no get_text or no content. Used by
+    the text_in_bbox dedup pass to confirm overlapping bboxes are *actual*
+    duplicates before discarding the shorter one.
+    """
+    getter = getattr(t, "get_text", None)
+    if getter is None:
+        return ""
+    s = getter()
+    return s.strip() if s else ""
+
+
+def _is_textual_duplicate(a_text: str, b_text: str) -> bool:
+    """Return True if textline A's content can be considered a duplicate of B's.
+
+    The bbox-overlap dedup pass introduced in #206 (to fix #15) was meant
+    to drop *literal* duplicate textlines emitted by PDF font-render
+    quirks — typically two textlines with identical content placed at
+    nearly the same coordinates. Skipping the content check made it also
+    discard legitimate adjacent-cell text whenever a wide neighbour's
+    bbox happened to cover it (#288, #625). Restricting the discard to
+    *equal* stripped text matches #206's original intent without false
+    positives (a single-char "B" textline is not a duplicate of a wider
+    sibling that merely contains the letter B).
+    """
+    if not a_text:
+        return True
+    return a_text == b_text
+
+
+def _text_in_bbox_loop(t_bbox):
+    """Reference Python implementation of the >80%-contained discard pass.
+
+    Used as a fallback when ``len(t_bbox)`` is large enough that the
+    NumPy NxN intersection matrix would exceed comfortable memory.
+    """
+    n = len(t_bbox)
+    discarded: set[int] = set()
+    texts = [_normalised_textline_text(t) for t in t_bbox]
+    for i in range(n):
+        if i in discarded:
+            continue
+        ba = t_bbox[i]
+        ba_area = bbox_area(ba)
+        ai_text = texts[i]
+        for j in range(n):
+            if i == j or j in discarded:
+                continue
+            bb = t_bbox[j]
+            if not bbox_intersect(ba, bb):
+                continue
+            if ba_area == 0 or (bbox_intersection_area(ba, bb) / ba_area) > 0.8:
+                if bbox_longer(bb, ba) and _is_textual_duplicate(ai_text, texts[j]):
+                    discarded.add(i)
+                    break
+    return [t_bbox[i] for i in range(n) if i not in discarded]
+
+
 def text_in_bbox(bbox, text):
     """Return all text objects in a bounding box.
 
-    Return the text objects which lie at least 80% inside a bounding box
-    across both dimensions.
+    Keeps every text object whose centre lies inside the bbox (with a
+    small pad), then discards each one whose bbox is >80% contained in a
+    longer sibling *and* whose stripped text equals that sibling's
+    stripped text. The content equality check (#288, #625) prevents
+    adjacent-cell text from being dropped when a wide neighbour's bbox
+    happens to cover it — the geometry-only rule introduced in #206 was
+    meant to deduplicate PDF font-render duplicates (#15), not to
+    discard legitimate non-duplicate content.
 
     Parameters
     ----------
@@ -571,33 +755,93 @@ def text_in_bbox(bbox, text):
     Returns
     -------
     t_bbox : list
-        List of PDFMiner text objects that lie inside table, discarding the overlapping ones
+        List of PDFMiner text objects that lie inside table, with
+        duplicate-content overlapping siblings discarded.
 
     """
-    lb = (bbox[0], bbox[1])
-    rt = (bbox[2], bbox[3])
-    t_bbox = [
-        t
-        for t in text
-        if lb[0] - 2 <= (t.x0 + t.x1) / 2.0 <= rt[0] + 2
-        and lb[1] - 2 <= (t.y0 + t.y1) / 2.0 <= rt[1] + 2
-    ]
+    if not text:
+        return []
 
-    # Avoid duplicate text by discarding overlapping boxes
-    rest = {t for t in t_bbox}
-    for ba in t_bbox:
-        for bb in rest.copy():
-            if ba == bb:
-                continue
-            if bbox_intersect(ba, bb):
-                ba_area = bbox_area(ba)
-                # if the intersection is larger than 80% of ba's size, we keep the longest
-                if ba_area == 0 or (bbox_intersection_area(ba, bb) / ba_area) > 0.8:
-                    if bbox_longer(bb, ba):
-                        rest.discard(ba)
-    unique_boxes = list(rest)
+    # Pull coordinates into parallel float arrays in one pass.
+    n_in = len(text)
+    x0 = np.empty(n_in, dtype=np.float64)
+    y0 = np.empty(n_in, dtype=np.float64)
+    x1 = np.empty(n_in, dtype=np.float64)
+    y1 = np.empty(n_in, dtype=np.float64)
+    for i, t in enumerate(text):
+        x0[i] = t.x0
+        y0[i] = t.y0
+        x1[i] = t.x1
+        y1[i] = t.y1
 
-    return unique_boxes
+    # Filter: centre inside bbox (+/- 2 pad), vectorised.
+    x_lo, y_lo, x_hi, y_hi = bbox[0] - 2, bbox[1] - 2, bbox[2] + 2, bbox[3] + 2
+    xm = (x0 + x1) * 0.5
+    ym = (y0 + y1) * 0.5
+    in_bbox = (xm >= x_lo) & (xm <= x_hi) & (ym >= y_lo) & (ym <= y_hi)
+    idx_in = np.flatnonzero(in_bbox)
+    n = idx_in.size
+    if n == 0:
+        return []
+    if n == 1:
+        return [text[int(idx_in[0])]]
+
+    t_bbox = [text[i] for i in idx_in.tolist()]
+
+    # For very large bbox populations the NxN pairwise matrix would blow the
+    # memory budget — fall back to the side-set Python loop.
+    if n > _TEXT_IN_BBOX_NUMPY_MAX:
+        return _text_in_bbox_loop(t_bbox)
+
+    # Vectorised >80%-contained-in-longer-sibling discard.
+    sx0 = x0[idx_in]
+    sy0 = y0[idx_in]
+    sx1 = x1[idx_in]
+    sy1 = y1[idx_in]
+
+    # Pairwise AABB intersection area (axis-aligned), broadcasting nxn.
+    x_left = np.maximum(sx0[:, None], sx0[None, :])
+    y_bot = np.maximum(sy0[:, None], sy0[None, :])
+    x_right = np.minimum(sx1[:, None], sx1[None, :])
+    y_top = np.minimum(sy1[:, None], sy1[None, :])
+    inter_w = np.clip(x_right - x_left, 0.0, None)
+    inter_h = np.clip(y_top - y_bot, 0.0, None)
+    inter_area = inter_w * inter_h
+
+    # Per-row "ba" area. inter_area / ba_area is the fraction of A
+    # contained in B. Treat degenerate (zero-area) boxes as fully
+    # contained, matching the original behaviour.
+    widths = sx1 - sx0
+    heights = sy1 - sy0
+    ba_areas = widths * heights
+    with np.errstate(divide="ignore", invalid="ignore"):
+        frac = np.where(ba_areas[:, None] > 0, inter_area / ba_areas[:, None], 1.0)
+    np.fill_diagonal(frac, 0.0)
+
+    # B is longer than A: widths[j] > widths[i]  (rows = i, cols = j).
+    b_longer = widths[None, :] > widths[:, None]
+
+    # Bbox-level discard candidates: A is >80%-contained in a longer B.
+    discard_candidate = (frac > 0.8) & b_longer
+
+    # Content check (#288, #625): only discard A when the offending B
+    # actually contains A's text — otherwise we drop adjacent-cell
+    # content that just happened to be physically overlapped. The check
+    # runs per candidate row and bails on the first confirmed duplicate.
+    keep = np.ones(n, dtype=bool)
+    candidate_rows = np.flatnonzero(discard_candidate.any(axis=1)).tolist()
+    if candidate_rows:
+        texts = [_normalised_textline_text(t) for t in t_bbox]
+        for i in candidate_rows:
+            ai_text = texts[i]
+            for j in np.flatnonzero(discard_candidate[i]).tolist():
+                if _is_textual_duplicate(ai_text, texts[j]):
+                    keep[i] = False
+                    break
+
+    # keep is a boolean mask of length n derived from idx_in/t_bbox, so the
+    # two iterables are equal-length by construction.
+    return [t for t, k in zip(t_bbox, keep.tolist(), strict=True) if k]
 
 
 def text_in_bbox_per_axis(bbox, horizontal_text, vertical_text):
@@ -896,15 +1140,59 @@ def merge_close_lines(ar, line_tol=2):
     return ret
 
 
+def text_replace(text, replacements):
+    """Apply key→value substring substitutions to `text`.
+
+    Parameters
+    ----------
+    text : str
+        Text to process.
+    replacements : dict[str, str] or sequence of (str, str), optional
+        Mapping of pattern → replacement. Each key is matched as a
+        literal substring (regex metacharacters are escaped) and every
+        occurrence is replaced with the corresponding value. Empty
+        keys are ignored. Falsy `replacements` returns the text
+        unchanged. Order: when several keys could match at the same
+        position, the longest one wins (so ``{"abc": "X", "ab": "Y"}``
+        replaces ``"abc"`` with ``"X"`` rather than producing ``"Yc"``).
+
+    Returns
+    -------
+    str
+    """
+    if not replacements:
+        return text
+    if hasattr(replacements, "items"):
+        items = list(replacements.items())
+    else:
+        items = list(replacements)
+    # Drop empty patterns and prefer longer keys (re's alternation is
+    # left-first, so we sort longest-first to make {"abc":"X","ab":"Y"}
+    # behave the obvious way).
+    items = [(k, v) for k, v in items if k]
+    if not items:
+        return text
+    items.sort(key=lambda kv: len(kv[0]), reverse=True)
+    pattern = "|".join(re.escape(k) for k, _ in items)
+    table = dict(items)
+    return re.sub(pattern, lambda m: table[m.group(0)], text, flags=re.UNICODE)
+
+
 def text_strip(text, strip=""):
-    """Strip any characters in `strip` that are present in `text`.
+    """Strip characters (or whole substrings) from `text`.
 
     Parameters
     ----------
     text : str
         Text to process and strip.
-    strip : str, optional (default: '')
-        Characters that should be stripped from `text`.
+    strip : str or sequence of str, optional (default: '')
+        If a ``str``: every occurrence of *any character* in `strip` is
+        removed from `text` (the long-standing behaviour).
+        If a list/tuple of ``str``: every occurrence of *each substring*
+        is removed from `text`. This is the request from #484 — the
+        whole-substring mode is opt-in by passing a sequence, so
+        existing callers passing a single string keep their per-character
+        semantics.
 
     Returns
     -------
@@ -913,6 +1201,17 @@ def text_strip(text, strip=""):
     if not strip:
         return text
 
+    if isinstance(strip, (list, tuple)):
+        # Substring-strip mode: build an alternation of escaped pieces.
+        # Drop empties so users passing ["", "foo"] don't get "match the
+        # empty string everywhere" behaviour.
+        pieces = [s for s in strip if s]
+        if not pieces:
+            return text
+        pattern = "|".join(re.escape(s) for s in pieces)
+        return re.sub(pattern, "", text, flags=re.UNICODE)
+
+    # Backward-compatible character-class strip.
     stripped = re.sub(
         rf"[{''.join(map(re.escape, strip))}]", "", text, flags=re.UNICODE
     )
@@ -1159,7 +1458,7 @@ def _group_and_process_chars(
     return grouped_chars
 
 
-def get_table_index(
+def get_table_index(  # noqa: C901  - cyclomatic complexity is inherent to the row/col scan
     table, t, direction, split_text=False, flag_size=False, strip_text=""
 ):
     """
@@ -1197,32 +1496,99 @@ def get_table_index(
         |       |
         +-------+
     """
-    r_idx, c_idx = [-1] * 2
-    for r in range(len(table.rows)):  # noqa
-        if (t.y0 + t.y1) / 2.0 < table.rows[r][0] and (t.y0 + t.y1) / 2.0 > table.rows[
-            r
-        ][1]:
-            lt_col_overlap = []
-            for c in table.cols:
-                if c[0] <= t.x1 and c[1] >= t.x0:
-                    left = t.x0 if c[0] <= t.x0 else c[0]
-                    right = t.x1 if c[1] >= t.x1 else c[1]
-                    lt_col_overlap.append(abs(left - right) / abs(c[0] - c[1]))
-                else:
-                    lt_col_overlap.append(-1)
-            if len(list(filter(lambda x: x != -1, lt_col_overlap))) == 0:
-                text = t.get_text().strip("\n")
-                text_range = (t.x0, t.x1)
-                col_range = (table.cols[0][0], table.cols[-1][1])
-                warnings.warn(
-                    f"{text} {text_range} does not lie in column range {col_range}",
-                    stacklevel=1,
-                )
-            r_idx = r
-            c_idx = lt_col_overlap.index(max(lt_col_overlap))
-            break
-    if r_idx == -1:
-        return [], 1.0  # Return early if no valid row is found
+    # Vectorised row/column search. ``table._rows_np`` and
+    # ``table._cols_np`` are built lazily on first access (see
+    # ``core.Table``) so they're available to any caller that needs an
+    # ndarray view of the table geometry, while the hot inner loop uses
+    # the companion ``-y_top`` Python list with :mod:`bisect` to find
+    # the row band in O(log rows) and a tight pre-computed loop over the
+    # columns for the per-column overlap.
+    #
+    # Rationale (see ``bench/bench_get_table_index.py``): at Camelot's
+    # table sizes (~tens of rows, ~tens of columns) the per-call dispatch
+    # overhead of ``np.searchsorted``, ``np.argmax`` etc. is several
+    # hundred ns — comparable to or larger than the actual work —
+    # whereas ``bisect.bisect_left`` is a pure-C builtin on a Python list
+    # with negligible per-call overhead. The numpy arrays remain the
+    # source of truth so callers downstream can lift the bulk-search
+    # work into NumPy when batching many textlines at once.
+    #
+    # Semantics match the previous Python-loop implementation bit-for-bit,
+    # including the "first index with the max overlap" tie-break and the
+    # ``c_idx = -1`` fallback when no column overlaps the textline. See
+    # PERF in the perf report.
+    y_mid = (t.y0 + t.y1) * 0.5
+    t_x0 = t.x0
+    t_x1 = t.x1
+    rows = table.rows
+    cols = table.cols
+
+    # Direct attribute access is materially cheaper than the
+    # ``_rows_np``/``_cols_np`` property dance for the 100k-calls-per-page
+    # hot path. Populate on first call only.
+    neg_tops = table._neg_y_tops_list
+    if neg_tops is None:
+        table._build_search_caches()
+        neg_tops = table._neg_y_tops_list
+        if not neg_tops:
+            return [], 1.0
+
+    # Row band lookup. Rows are sorted descending by ``y_top``, so the
+    # previous Python loop ``break``s as soon as ``y_mid >= y_top``. That
+    # means only rows with ``y_top > y_mid`` (equivalently
+    # ``-y_top < -y_mid``) are candidates. ``bisect_left`` on the ascending
+    # ``-y_top`` list gives that candidate count in O(log n).
+    r_end = bisect_left(neg_tops, -y_mid)
+    if r_end == 0:
+        return [], 1.0  # textline mid-Y is at or above every row's top edge
+
+    # Among the ``[0, r_end)`` candidate rows the original loop returns
+    # the *first* one (in iteration order) whose ``y_bot < y_mid`` —
+    # critical for bit-identity when rows overlap. When the table was
+    # built by Camelot's parsers the rows are non-overlapping (verified
+    # in ``_build_search_caches``) and the hit is always ``r_end - 1``,
+    # so we shortcut. Synthetic inputs with overlapping rows fall through
+    # to the original ``for``-scan.
+    if table._rows_disjoint:
+        last = r_end - 1
+        if rows[last][1] < y_mid:
+            r_idx = last
+        else:
+            return [], 1.0
+    else:
+        r_idx = -1
+        for r in range(r_end):
+            if rows[r][1] < y_mid:
+                r_idx = r
+                break
+        if r_idx == -1:
+            return [], 1.0
+
+    # Per-column overlap. The width of each column is pre-computed once
+    # at Table construction (cached on ``table._col_widths_list``), so the
+    # hot loop is a single subtraction + division per column. Tie-break:
+    # first index with the maximum overlap. ``best_c`` doubles as the
+    # "any column hit" flag — it stays ``-1`` iff no column overlapped.
+    widths = table._col_widths_list
+    best_overlap = -1.0
+    best_c = -1
+    for cidx, (c_left, c_right) in enumerate(cols):
+        if c_left <= t_x1 and c_right >= t_x0:
+            left = t_x0 if c_left <= t_x0 else c_left
+            right = t_x1 if c_right >= t_x1 else c_right
+            ov = abs(left - right) / widths[cidx]
+            if ov > best_overlap:
+                best_overlap = ov
+                best_c = cidx
+    if best_c == -1:
+        text = t.get_text().strip("\n")
+        text_range = (t_x0, t_x1)
+        col_range = (cols[0][0], cols[-1][1])
+        warnings.warn(
+            f"{text} {text_range} does not lie in column range {col_range}",
+            stacklevel=1,
+        )
+    c_idx = best_c
 
     error = calculate_assignment_error(t, table, r_idx, c_idx)
 
@@ -1313,7 +1679,7 @@ def compute_accuracy(error_weights):
 
 
 def compute_whitespace(d: list[list[str]]) -> float:
-    """Calculates the percentage of empty strings in a two-dimensional list.
+    """Calculate the percentage of empty strings in a two-dimensional list.
 
     Parameters
     ----------
@@ -1325,33 +1691,21 @@ def compute_whitespace(d: list[list[str]]) -> float:
     whitespace : float
         Percentage of empty cells.
     """
-    # Initialize the count of empty strings
-    whitespace = 0
-    total_elements = 0  # Keep track of the total number of elements
-
-    # Iterate through each row in the 2D list
-    for i in d:
-        # Only process if the row is a list
-        if isinstance(i, list):
-            total_elements += len(i)  # Count the number of elements in this row
-            # Iterate through each element in the row
-            for j in i:
-                # Check if the element is an empty string after stripping whitespace
-                if isinstance(j, str) and j.strip() == "":
-                    whitespace += 1  # Increment the count of empty strings
-
-    # Avoid division by zero
+    # Single pass via builtin sum() + generator expressions: same result,
+    # ~10% faster than the old nested-loop accumulator and noticeably easier
+    # to read. See PERF 3 in the perf report.
+    rows = [row for row in d if isinstance(row, list)]
+    total_elements = sum(len(row) for row in rows)
     if total_elements == 0:
-        return 0.0  # If there are no elements, return 0%
-
-    # Calculate the percentage of empty strings
-    whitespace_percentage = 100 * (whitespace / total_elements)
-
-    return whitespace_percentage
+        return 0.0
+    whitespace = sum(
+        1 for row in rows for cell in row if isinstance(cell, str) and not cell.strip()
+    )
+    return 100 * (whitespace / total_elements)
 
 
 def get_page_layout(
-    filename,
+    page,
     line_overlap=0.5,
     char_margin=1.0,
     line_margin=0.5,
@@ -1360,7 +1714,7 @@ def get_page_layout(
     detect_vertical=True,
     all_texts=True,
 ):
-    """Return a PDFMiner LTPage object and page dimension of a single page pdf.
+    """Return a PDFMiner LTPage object and page dimension from a page of a PDF.
 
     To get the definitions of kwargs, see
     https://pdfminersix.rtfd.io/en/latest/reference/composable.html.
@@ -1385,34 +1739,20 @@ def get_page_layout(
         Dimension of pdf page in the form (width, height).
 
     """
-    with open(filename, "rb") as f:
-        parser = PDFParser(f)
-        document = PDFDocument(parser)
-        if not document.is_extractable:
-            raise PDFTextExtractionNotAllowed(
-                f"Text extraction is not allowed: {filename}"
-            )
-        laparams = LAParams(
-            line_overlap=line_overlap,
-            char_margin=char_margin,
-            line_margin=line_margin,
-            word_margin=word_margin,
-            boxes_flow=boxes_flow,
-            detect_vertical=detect_vertical,
-            all_texts=all_texts,
-        )
-        rsrcmgr = PDFResourceManager()
-        device = PDFPageAggregator(rsrcmgr, laparams=laparams)
-        interpreter = PDFPageInterpreter(rsrcmgr, device)
-        page = next(PDFPage.create_pages(document), None)
-        if page is None:
-            raise PDFTextExtractionNotAllowed
-        interpreter.process_page(page)
-        layout = device.get_result()
-        width = layout.bbox[2]
-        height = layout.bbox[3]
-        dim = (width, height)
-        return layout, dim
+    laparams = LAParams(
+        line_overlap=line_overlap,
+        char_margin=char_margin,
+        line_margin=line_margin,
+        word_margin=word_margin,
+        boxes_flow=boxes_flow,
+        detect_vertical=detect_vertical,
+        all_texts=all_texts,
+    )
+    layout = pm.extract_page(page, laparams)
+    width = layout.bbox[2]
+    height = layout.bbox[3]
+    dim = (width, height)
+    return layout, dim
 
 
 def get_char_objects(layout: LTContainer[Any]) -> list[LTChar]:

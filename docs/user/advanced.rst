@@ -35,6 +35,83 @@ To process background lines, you can pass ``process_background=True``.
   :file: ../_static/csv/background_lines.csv
   :class: full-width
 
+Bridge gaps in ruled lines
+--------------------------
+
+When a Lattice-flavoured PDF's table is drawn with ruled lines that don't quite meet at corners (a common artefact of older scanned-then-redrawn forms), the detected grid drops the affected rows or columns. The ``iterations`` keyword argument dilates the line mask to close those gaps — but dilation alone also *thickens* every line, which in turn pushes the outer ruled lines outward and adds spurious extra rows above and below the real table.
+
+Pair it with the new ``erode_iterations`` keyword to perform a **morphological closing** (dilate then erode of equal count): gaps are bridged without changing the line mask's overall size, so the detected grid stays right.
+
+.. code-block:: pycon
+
+    >>> # Bridges line gaps without thickening
+    >>> tables = camelot.read_pdf(
+    ...     'broken_lines.pdf',
+    ...     flavor='lattice',
+    ...     iterations=1,
+    ...     erode_iterations=1,
+    ... )
+
+``erode_iterations`` defaults to ``0`` (fully backward-compatible with the long-standing dilate-only behaviour). Bump it together with ``iterations`` only when you've confirmed the legacy behaviour leaves phantom rows around your table.
+
+.. _line_detection_engine:
+
+Line-detection engine: raster, combined, auto
+---------------------------------------------
+
+By default :ref:`Lattice <lattice>` finds a table's ruled lines by **rasterising** the page (rendering it to an image) and detecting lines with OpenCV. That works well for scanned or image-based tables, but a PDF that draws its rules as *native vector graphics* carries the exact line coordinates already — and those rules sometimes render faintly or anti-aliased, so the rasteriser misses them.
+
+The ``engine`` keyword lets you choose how lines are detected:
+
+- ``'raster'`` *(default)* — OpenCV on the rendered page. The long-standing behaviour.
+- ``'combined'`` — run raster detection **and** union in the ruled lines read straight from the PDF's vector graphics before the grid is reconstructed. A table whose rules are vector strokes is then found even when it renders faintly.
+- ``'auto'`` — use ``'combined'`` when the page actually carries vector ruled lines, otherwise fall back to ``'raster'``.
+- ``'vector'`` — detect tables purely from the PDF's vector ruled lines, skipping rasterisation entirely. The fastest engine (no page render, no OpenCV), for PDFs whose tables are drawn with real vector strokes. A page with no vector ruled lines yields no tables, so prefer ``'auto'`` / ``'combined'`` for mixed documents.
+
+.. code-block:: pycon
+
+    >>> # Recover a faintly-ruled vector table that 'raster' misses
+    >>> tables = camelot.read_pdf(
+    ...     'vector_ruled.pdf',
+    ...     flavor='lattice',
+    ...     engine='combined',
+    ... )
+
+``'combined'`` is **safe to try on any lattice PDF**: raster detection always runs first, so the vector lines can only *add* to what was found, never remove it. On a PDF whose rules the rasteriser already detects cleanly, ``engine='combined'`` returns exactly the same tables as ``engine='raster'``.
+
+The same keyword works with ``flavor='hybrid'``, where it drives the lattice half of the hybrid parser:
+
+.. code-block:: pycon
+
+    >>> tables = camelot.read_pdf(
+    ...     'mixed_layout.pdf',
+    ...     flavor='hybrid',
+    ...     engine='combined',
+    ... )
+
+.. _filter_tables:
+
+Filter out noise tables
+-----------------------
+
+Detection sometimes returns small or low-quality "tables" — a stray single
+cell, a mostly-empty region, a heading mistaken for a 1x1 grid. :meth:`TableList.filter() <camelot.core.TableList.filter>` keeps only the tables that pass the thresholds you give and returns a new :class:`~camelot.core.TableList`; extraction itself is unchanged.
+
+.. code-block:: pycon
+
+    >>> tables = camelot.read_pdf('noisy.pdf')
+    >>> # keep tables with at least 2 rows and 2 columns
+    >>> real = tables.filter(min_rows=2, min_columns=2)
+    >>> # …or filter on parsing quality, and compose freely
+    >>> good = tables.filter(min_accuracy=90).filter(max_whitespace=50)
+
+Every threshold defaults to a no-op (``min_rows=1``, ``min_columns=1``,
+``min_accuracy=0``, ``max_whitespace=100``), so a legitimate single-row or
+single-column table is never dropped unless you ask for it. ``accuracy`` and
+``whitespace`` are the same 0–100 values reported in
+:attr:`Table.parsing_report <camelot.core.Table.parsing_report>`.
+
+.. _visual_debug:
 Visual debugging
 ----------------
 
@@ -206,11 +283,12 @@ In cases such as `these <../_static/pdf/table_areas.pdf>`__, it can be useful to
 
 Table areas that you want camelot to analyze can be passed as a list of comma-separated strings to :meth:`read_pdf() <camelot.read_pdf>`, using the ``table_areas`` keyword argument.
 
-.. code-block:: pycon
-  :class: full-width
+.. container:: full-width
 
-    >>> tables = camelot.read_pdf('table_areas.pdf', flavor='stream', table_areas=['316,499,566,337'])
-    >>> tables[0].df
+   .. code-block:: pycon
+
+       >>> tables = camelot.read_pdf('table_areas.pdf', flavor='stream', table_areas=['316,499,566,337'])
+       >>> tables[0].df
 
 .. tip::
     Here's how you can do the same with the :ref:`command-line interface <cli>`.
@@ -225,6 +303,13 @@ Table areas that you want camelot to analyze can be passed as a list of comma-se
 
 
 .. note:: ``table_areas`` accepts strings of the form x1,y1,x2,y2 where (x1, y1) -> top-left and (x2, y2) -> bottom-right in PDF coordinate space. In PDF coordinate space, the bottom-left corner of the page is the origin, with coordinates (0, 0).
+
+If your coordinates come from a rendered page image, use ``camelot.image_bbox_to_pdf()`` to convert the image-pixel bounding box into the PDF-space string expected by ``table_areas``:
+
+.. code-block:: pycon
+
+    >>> area = camelot.image_bbox_to_pdf((300, 600, 1800, 1500), (2550, 3300), (612, 792), as_string=True)
+    >>> tables = camelot.read_pdf('table_areas.pdf', flavor='stream', table_areas=[area])
 
 Specify table regions
 ---------------------
@@ -248,6 +333,50 @@ You can use the ``table_regions`` keyword argument to :meth:`read_pdf() <camelot
 .. csv-table::
   :file: ../_static/csv/table_regions.csv
 
+Derive table area from header and footer text
+---------------------------------------------
+
+With :ref:`Stream <stream>`, when each table is framed by the *same* header
+and/or footer text on every page — common in financial and government reports
+— you can let camelot derive the table area from those text lines instead of
+hand-specifying ``table_areas`` coordinates.
+
+Pass ``header_text`` and/or ``footer_text`` to :meth:`read_pdf() <camelot.read_pdf>`
+as lists of substrings. camelot locates the matching text line and uses its
+edge as the table boundary: the **bottom** of the matched ``header_text`` line
+becomes the table's top edge, and the **top** of the matched ``footer_text``
+line becomes its bottom edge.
+
+.. code-block:: pycon
+
+    >>> tables = camelot.read_pdf(
+    ...     'health.pdf',
+    ...     flavor='stream',
+    ...     header_text=['Public Health Outlay'],
+    ...     footer_text=['Health Sector Financing'],
+    ... )
+    >>> tables[0].df
+
+You can pass either one or both. With only ``header_text`` the area runs from
+the header line down to the bottom of the page; with only ``footer_text`` it
+runs from the top of the page down to the footer line.
+
+.. note::
+    A few details worth knowing:
+
+    - Matching is **substring-based and case-sensitive** — ``header_text=['Outlay']``
+      matches a line containing ``"Public Health Outlay"``. The topmost matching
+      line is used for ``header_text`` and the bottommost for ``footer_text``.
+    - If an anchor you specified is **not found** on the page (for example you
+      pass both ``header_text`` and ``footer_text`` but only the header matches),
+      camelot falls back to its automatic table detection rather than guessing.
+    - Explicit ``table_areas`` always takes precedence over ``header_text`` /
+      ``footer_text``. The derived area is also clipped to any ``table_regions``
+      you supply.
+    - These are :ref:`Stream <stream>` (text-based) options and are rejected for
+      ``flavor='lattice'``. They are available through the Python API only, not
+      the command-line interface.
+
 Specify column separators
 -------------------------
 
@@ -261,11 +390,12 @@ For example, if you have specified two table areas, ``table_areas=['12,54,43,23'
 
 Let's get back to the *x* coordinates we got from plotting the text that exists on this `PDF <../_static/pdf/column_separators.pdf>`__, and get the table out!
 
-.. code-block:: pycon
-  :class: full-width
+.. container:: full-width
 
-    >>> tables = camelot.read_pdf('column_separators.pdf', flavor='stream', columns=['72,95,209,327,442,529,566,606,683'])
-    >>> tables[0].df
+   .. code-block:: pycon
+
+       >>> tables = camelot.read_pdf('column_separators.pdf', flavor='stream', columns=['72,95,209,327,442,529,566,606,683'])
+       >>> tables[0].df
 
 .. tip::
     Here's how you can do the same with the :ref:`command-line interface <cli>`.
@@ -282,18 +412,19 @@ Let's get back to the *x* coordinates we got from plotting the text that exists 
     "NUMBER TYPE DBA NAME","","","LICENSEE NAME","ADDRESS","CITY","ST","ZIP","PHONE NUMBER","EXPIRES"
     "...","...","...","...","...","...","...","...","...","..."
 
-Ah! Since `PDFMiner <https://github.com/pdfminer/pdfminer.six>`_ merged the strings, "NUMBER", "TYPE" and "DBA NAME", all of them were assigned to the same cell. Let's see how we can fix this in the next section.
+Ah! Since `playa <https://pypi.org/project/playa-pdf/>`_ (the PDFMiner-compatible layout engine Camelot now uses) merged the strings, "NUMBER", "TYPE" and "DBA NAME", all of them were assigned to the same cell. Let's see how we can fix this in the next section.
 
 Split text along separators
 ---------------------------
 
-To deal with cases like the output from the previous section, you can pass ``split_text=True`` to :meth:`read_pdf() <camelot.read_pdf>`, which will split any strings that lie in different cells but have been assigned to a single cell (as a result of being merged together by `PDFMiner <https://github.com/pdfminer/pdfminer.six>`_).
+To deal with cases like the output from the previous section, you can pass ``split_text=True`` to :meth:`read_pdf() <camelot.read_pdf>`, which will split any strings that lie in different cells but have been assigned to a single cell (as a result of being merged together by `playa <https://pypi.org/project/playa-pdf/>`_, the PDFMiner-compatible layout engine).
 
-.. code-block:: pycon
-  :class: full-width
+.. container:: full-width
 
-    >>> tables = camelot.read_pdf('column_separators.pdf', flavor='stream', columns=['72,95,209,327,442,529,566,606,683'], split_text=True)
-    >>> tables[0].df
+   .. code-block:: pycon
+
+       >>> tables = camelot.read_pdf('column_separators.pdf', flavor='stream', columns=['72,95,209,327,442,529,566,606,683'], split_text=True)
+       >>> tables[0].df
 
 .. tip::
     Here's how you can do the same with the :ref:`command-line interface <cli>`.
@@ -323,7 +454,7 @@ In this case, the text that `other tools`_ return, will be ``24.912``. This is r
 
 You can solve this by passing ``flag_size=True``, which will enclose the superscripts and subscripts with ``<s></s>``, based on font size, as shown below.
 
-.. _other tools: https://github.com/camelot-dev/camelot/wiki/Comparison-with-other-PDF-Table-Extraction-libraries-and-tools
+.. _other tools: comparison.html
 
 .. code-block:: pycon
 
@@ -371,6 +502,109 @@ You can strip unwanted characters like spaces, dots and newlines from a string u
     "Property crime","1,396 .4","338 .7","1,057 .7","875 .9","210 .8","665 .1","608 .2","127 .9","392 .6"
     "Burglary","240.9","60.3","180.6","205.0","53.4","151.7","35.9","6.9","29.0"
     "...","...","...","...","...","...","...","...","...","..."
+
+The ``strip_text`` argument also accepts a **list or tuple of substrings**, in which case each whole substring is removed wherever it appears (rather than each individual character). This is the right mode when you want to strip multi-character markers like footnote references without nicking lone brackets / digits elsewhere in the cell:
+
+.. code-block:: pycon
+
+    >>> # Per-character (long-standing behaviour): strips any of '[', ']', '1', '2'
+    >>> camelot.read_pdf('doc.pdf', strip_text='[12]')
+
+    >>> # Per-substring (new in 2.0): strips only the literal markers '[1]' and '[2]',
+    >>> # leaves stray '[' or ']' alone.
+    >>> camelot.read_pdf('doc.pdf', strip_text=['[1]', '[2]'])
+
+Replace text in cells
+---------------------
+
+Where ``strip_text`` can only **remove** characters or substrings, ``replace_text`` lets you **rewrite** them. It accepts a ``dict`` mapping substrings to their replacements, applied to every cell's text just before assignment.
+
+A common motivating example: words that PDF text extraction has split across a soft line break end up concatenated without a space. Use ``replace_text`` to turn `" \n"` (space + newline) into a single space:
+
+.. code-block:: pycon
+
+    >>> tables = camelot.read_pdf('doc.pdf', replace_text={' \n': ' '})
+
+You can normalise unit names, expand abbreviations, or fix systematic OCR-style mistakes in the same call:
+
+.. code-block:: pycon
+
+    >>> tables = camelot.read_pdf(
+    ...     'doc.pdf',
+    ...     replace_text={'kw': 'kW', 'kva': 'kVA', 'µ': 'micro'},
+    ... )
+
+Keys are matched as literal substrings (regex metacharacters are escaped, so ``"."`` matches a literal dot). When several keys could match at the same position, the longest one wins, so ``{"abc": "X", "ab": "Y"}`` replaces ``"abc"`` with ``"X"`` rather than producing ``"Yc"``. Empty keys are ignored.
+
+``replace_text`` works with every flavor (``lattice``, ``stream``, ``network``, ``hybrid``) and stacks cleanly with ``strip_text`` — stripping runs first, then replacement.
+
+Per-page parameter overrides
+----------------------------
+
+When a single PDF has pages with different table layouts — say a cover page with no table, two body pages with stream-flavour text columns, and an appendix with a ruled lattice table — calling :meth:`read_pdf() <camelot.read_pdf>` once per page-group works but means re-opening the PDF and re-running parser setup each time.
+
+The ``per_page`` keyword argument lets you keep the global kwargs and override just the ones that need to change for specific pages:
+
+.. code-block:: pycon
+
+    >>> tables = camelot.read_pdf(
+    ...     'report.pdf',
+    ...     pages='1-3',
+    ...     flavor='stream',
+    ...     split_text=True,
+    ...     per_page={2: {'table_areas': ['120, 210, 400, 90']}},
+    ... )
+
+Here pages 1 and 3 use ``flavor='stream'`` with ``split_text=True``. Page 2 uses both **and** the page-specific ``table_areas``.
+
+The ``per_page`` keys are 1-indexed page numbers (int or str). The values are dicts of any kwarg otherwise valid for :meth:`read_pdf() <camelot.read_pdf>`, including a per-page ``flavor``. Unknown kwargs and unknown flavors raise the same errors as if they were passed globally, named by their offending page.
+
+Reading PDFs from memory
+------------------------
+
+Beyond filesystem paths and URLs, :meth:`read_pdf() <camelot.read_pdf>` accepts in-memory PDF content directly: ``bytes``, ``bytearray``, an ``io.BytesIO``, or any binary stream with a ``.read()`` method (an open ``"rb"`` file, a ``requests`` response's ``.raw``, etc.):
+
+.. code-block:: pycon
+
+    >>> import io, requests, camelot
+    >>>
+    >>> # Bytes you already have in memory
+    >>> data = open('doc.pdf', 'rb').read()
+    >>> camelot.read_pdf(data)
+    >>>
+    >>> # An io.BytesIO
+    >>> camelot.read_pdf(io.BytesIO(data))
+    >>>
+    >>> # Straight from an HTTP response
+    >>> resp = requests.get('https://example.org/doc.pdf')
+    >>> camelot.read_pdf(io.BytesIO(resp.content))
+
+Camelot writes the bytes to a temporary file once internally (so the Lattice OpenCV image-conversion backend keeps working unchanged) and removes the temp file when the handler is closed. For file-like inputs the read position is preserved so the caller can keep using the same stream afterwards.
+
+Log per-page progress on large PDFs
+-----------------------------------
+
+On long multi-page documents, extraction can run for a while with no output.
+:meth:`read_pdf() <camelot.read_pdf>` emits a per-page progress line on the
+``camelot`` logger at ``INFO`` level, so you can tell which page is being
+processed instead of wondering whether the call has hung. As for any library,
+logging is silent by default — enable it to see the messages:
+
+.. code-block:: pycon
+
+    >>> import logging
+    >>> logging.basicConfig(level=logging.INFO)
+    >>> tables = camelot.read_pdf('large.pdf', pages='all')
+    INFO:camelot:Processing page 1
+    INFO:camelot:Processing page 2
+
+Pass ``suppress_stdout=True`` to :meth:`read_pdf() <camelot.read_pdf>` to silence
+the per-page progress logs.
+
+.. note::
+    With ``parallel=True`` the pages are parsed in worker processes, so the
+    progress lines are emitted there and may not propagate to the logging
+    handlers configured in your main process (and pages finish out of order).
 
 Improve guessed table areas
 ---------------------------
@@ -634,9 +868,9 @@ We don't need anything else. Now, let's pass ``copy_text=['v']`` to copy text in
 Tweak layout generation
 -----------------------
 
-camelot is built on top of PDFMiner's functionality of grouping characters on a page into words and sentences. In some cases (such as `#170 <https://github.com/atlanhq/camelot/issues/170>`_ and `#215 <https://github.com/atlanhq/camelot/issues/215>`_), PDFMiner can group characters that should belong to the same sentence into separate sentences.
+Camelot is built on top of `playa <https://pypi.org/project/playa-pdf/>`_'s PDFMiner-compatible functionality for grouping characters on a page into words and sentences. In some cases (such as `#170 <https://github.com/atlanhq/camelot/issues/170>`_ and `#215 <https://github.com/atlanhq/camelot/issues/215>`_), the layout engine can group characters that should belong to the same sentence into separate sentences.
 
-To deal with such cases, you can tweak PDFMiner's `LAParams kwargs <https://pdfminersix.readthedocs.io/en/latest/reference/composable.html#laparams>`_ to improve layout generation, by passing the keyword arguments as a dict using ``layout_kwargs`` in :meth:`read_pdf() <camelot.read_pdf>`. To know more about the parameters you can tweak, you can check out `PDFMiner docs <https://pdfminersix.rtfd.io/en/latest/reference/composable.html>`_.
+To deal with such cases, you can tweak the layout engine's `LAParams kwargs <https://pdfminersix.readthedocs.io/en/latest/reference/composable.html#laparams>`_ to improve layout generation, by passing the keyword arguments as a dict using ``layout_kwargs`` in :meth:`read_pdf() <camelot.read_pdf>`. ``playa.miner`` mirrors PDFMiner.six's ``LAParams``, so the upstream `PDFMiner.six docs <https://pdfminersix.rtfd.io/en/latest/reference/composable.html>`_ still describe what each parameter does.
 
 .. code-block:: pycon
 
@@ -668,3 +902,72 @@ If you face issues with ``pdfium``, ``ghostscript`` and ``poppler``, you can sup
     >>>         pass
     >>>
     >>> tables = camelot.read_pdf(filename, backend=ConversionBackend())
+
+Working with image-based / scanned PDFs
+---------------------------------------
+
+Camelot extracts tables by reading the PDF's text operators — fonts,
+positions, kerning. For PDFs that are **image-only** (scanned pages
+saved to PDF, faxed forms, photos exported to PDF) there is no text
+to read; every "table" is just pixels and Camelot will report zero
+tables found.
+
+The recommended workflow is to **add a text layer first, then run
+Camelot**. `OCRmyPDF <https://ocrmypdf.readthedocs.io/>`_ is a
+mature, dedicated tool for exactly this — it wraps Tesseract OCR and
+overlays the recognised text on the original page images, so the
+output PDF reads exactly like the input but now has selectable,
+searchable, extractable text underneath.
+
+Install once:
+
+.. code-block:: shell
+
+    $ pipx install ocrmypdf  # or: pip install ocrmypdf
+
+…then run it in front of Camelot:
+
+.. code-block:: shell
+
+    $ ocrmypdf scan.pdf scan-ocr.pdf
+    $ camelot lattice --output tables.csv scan-ocr.pdf
+
+…or as a Python pipeline:
+
+.. code-block:: pycon
+
+    >>> import subprocess
+    >>> import camelot
+    >>> subprocess.run(["ocrmypdf", "scan.pdf", "scan-ocr.pdf"], check=True)
+    >>> tables = camelot.read_pdf("scan-ocr.pdf", flavor="lattice")
+
+A few practical notes:
+
+- **Mixed PDFs** (some pages text, some scanned) are handled by
+  default — ``ocrmypdf`` will skip pages that already have a text
+  layer unless you pass ``--force-ocr``.
+- **Languages other than English** need the corresponding Tesseract
+  language pack installed (e.g. ``apt install tesseract-ocr-deu``
+  for German), then ``ocrmypdf -l deu scan.pdf scan-ocr.pdf``.
+- **Table-friendly OCR** benefits from a higher resolution and from
+  preserving the original image. ``ocrmypdf --image-dpi 300
+  --redo-ocr`` is a reasonable default for documents whose scans are
+  fuzzy.
+- **Quality**: lattice-style ruled tables typically survive OCR well
+  because the ruling lines are pixel-perfect; stream-style borderless
+  tables depend heavily on how well Tesseract aligns the per-cell
+  text — try ``flavor="auto"`` or ``flavor="hybrid"`` and inspect
+  ``Table.parsing_report`` (especially the ``confidence`` field) to
+  pick the better path.
+
+Why isn't OCR built into Camelot? Tesseract is a heavyweight system
+dependency (binary install + language packs, hundreds of MB), and
+OCR quality is non-deterministic across versions — bundling it would
+make the install story much worse for the majority of users who
+already have text PDFs. Keeping OCR as a separate preprocessing step
+lets ``ocrmypdf`` handle the OCR concerns (image preprocessing,
+language detection, page rotation, etc.) and Camelot focus on the
+post-OCR text-to-table conversion.
+
+For a full discussion see `issue #14 <https://github.com/camelot-dev/camelot/issues/14>`_
+and `PR #209 <https://github.com/camelot-dev/camelot/pull/209>`_.

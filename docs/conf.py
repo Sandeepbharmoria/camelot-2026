@@ -20,7 +20,6 @@ import sys
 
 import camelot
 
-
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
@@ -176,6 +175,15 @@ html_favicon = "_static/favicon.ico"
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
 html_static_path = ["_static"]
+
+# Brand overlay on top of sphinx-book-theme: paint links / accents the
+# Camelot logo green (sampled from docs/_static/camelot.png).
+html_css_files = ["camelot-theme.css"]
+
+# Tiny dependency-free helper that wires click-to-sort onto any
+# <table class="sortable">. Currently used by the comparison-matrix
+# on docs/user/comparison.rst.
+html_js_files = ["sortable-table.js"]
 
 # Add any extra paths that contain custom files (such as robots.txt or
 # .htaccess) here, relative to this directory. These files are copied

@@ -104,3 +104,69 @@ def test_lattice_split_text(testdir):
     tables = camelot.read_pdf(filename, line_scale=60, split_text=True)
 
     assert_frame_equal(df, tables[0].df)
+
+
+def test_lattice_rejects_mostly_empty_grid():
+    # #36 precision gate: a near-empty ruled grid is detection noise, not a
+    # table, and must be dropped; a normally-filled table is kept.
+    from types import SimpleNamespace
+
+    from camelot.parsers.lattice import _GRID_WHITESPACE_REJECT
+    from camelot.parsers.lattice import Lattice
+
+    parser = Lattice()
+    assert parser._reject_table(SimpleNamespace(whitespace=_GRID_WHITESPACE_REJECT + 1))
+    assert not parser._reject_table(SimpleNamespace(whitespace=40.0))
+
+
+def test_network_keeps_sparse_tables():
+    # The gate is lattice-only — text-based parsers must not inherit it.
+    from types import SimpleNamespace
+
+    from camelot.parsers import Network
+
+    assert not Network()._reject_table(SimpleNamespace(whitespace=99.0))
+
+
+def test_lattice_engine_default_is_combined():
+    # #763 / item-2: 'combined' is the default lattice engine.
+    from camelot.parsers import Lattice
+
+    assert Lattice().engine == "combined"
+
+
+def test_lattice_engine_auto_rejected():
+    # engine='auto' was dropped in the flavor x engine cleanup.
+    import pytest
+
+    from camelot.parsers import Lattice
+
+    with pytest.raises(ValueError, match="engine must be"):
+        Lattice(engine="auto")
+
+
+def test_engine_rejected_for_non_lattice_flavor(testdir):
+    # engine is lattice-only; passing it to a text-based flavor errors.
+    import pytest
+
+    import camelot
+
+    filename = os.path.join(testdir, "foo.pdf")
+    with pytest.raises(ValueError, match="engine"):
+        camelot.read_pdf(filename, flavor="network", engine="combined")
+
+
+def test_combined_respects_table_regions(testdir):
+    # Regression: combined's vector lines must be clipped to table_regions,
+    # so it never expands the table beyond the region vs raster.
+    import camelot
+
+    filename = os.path.join(testdir, "table_region.pdf")
+    region = ["170,370,560,270"]
+    r = camelot.read_pdf(
+        filename, table_regions=region, engine="raster", suppress_stdout=True
+    )
+    c = camelot.read_pdf(
+        filename, table_regions=region, engine="combined", suppress_stdout=True
+    )
+    assert c[0].shape == r[0].shape

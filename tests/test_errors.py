@@ -4,6 +4,7 @@ import warnings
 from unittest import mock
 
 import pytest
+from playa.exceptions import PDFTextExtractionNotAllowed
 
 import camelot
 from camelot.backends.image_conversion import ImageConversionError
@@ -14,7 +15,7 @@ from tests.conftest import skip_on_windows
 def test_unknown_flavor(foo_pdf):
     message = (
         "Unknown flavor specified."
-        " Use either 'lattice', 'stream', 'network' or 'hybrid'"
+        " Use either 'lattice', 'stream', 'network', 'hybrid', 'ml' or 'auto'"
     )
     with pytest.raises(NotImplementedError, match=message):
         camelot.read_pdf(foo_pdf, flavor="chocolate")
@@ -26,11 +27,18 @@ def test_input_kwargs(foo_pdf):
         camelot.read_pdf(foo_pdf, columns=["10,20,30,40"])
 
 
-def test_unsupported_format(testdir):
-    message = "File format not supported"
-    filename = os.path.join(testdir, "foo.csv")
-    with pytest.raises(NotImplementedError, match=message):
-        camelot.read_pdf(filename)
+def test_pdf_without_pdf_extension(testdir, tmp_path):
+    """Non-`.pdf` filenames containing valid PDF bytes are accepted (#646).
+
+    NamedTemporaryFile and similar producers commonly omit the suffix; the
+    file-extension check used to reject them even though the bytes parse
+    fine. Symmetric with the Path-arg path, which already bypassed it.
+    """
+    src = os.path.join(testdir, "foo.pdf")
+    dst = tmp_path / "no_extension"
+    dst.write_bytes(open(src, "rb").read())
+    tables = camelot.read_pdf(str(dst))
+    assert len(tables) == 1
 
 
 @skip_on_windows
@@ -73,7 +81,7 @@ def test_bad_password(testdir):
 
 
 def test_stream_equal_length(foo_pdf):
-    message = "Length of table_areas and columns" " should be equal"
+    message = "Length of table_areas and columns should be equal"
     with pytest.raises(ValueError, match=message):
         camelot.read_pdf(
             foo_pdf,
@@ -142,11 +150,14 @@ def test_lattice_no_convert_method(foo_pdf):
 
 
 def test_invalid_url():
+    # `fttp://` is not a recognised URL scheme, so is_url returns False and
+    # the string is treated as a file path. Since no such file exists, a
+    # FileNotFoundError is raised (rather than the old extension-check
+    # NotImplementedError, which was removed in #646).
     url = "fttp://google.com/pdf"
-    message = "File format not supported"
-    with pytest.raises(Exception, match=message):
-        url = camelot.read_pdf(url)
     assert is_url(url) is False
+    with pytest.raises((FileNotFoundError, OSError)):
+        camelot.read_pdf(url)
 
 
 def test_pdfium_backend_import_error(testdir):
@@ -190,3 +201,9 @@ def test_ghostscript_backend_import_error(testdir):
                 use_fallback=False,
             )
         assert message in str(e.value)
+
+
+def test_extraction_not_allowed(testdir):
+    filename = os.path.join(testdir, "birdisland.pdf")
+    with pytest.raises(PDFTextExtractionNotAllowed):
+        camelot.read_pdf(filename, flavor="stream")

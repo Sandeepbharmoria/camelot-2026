@@ -17,7 +17,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Draft Release
-        uses: release-drafter/release-drafter@v6
+        uses: release-drafter/release-drafter@v7.7.0
         with:
           publish: false
         env:
@@ -35,13 +35,13 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.release.tag_name }}
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.10"
 
@@ -52,7 +52,7 @@ jobs:
         run: python -m build
 
       - name: Sign the dists with Sigstore
-        uses: sigstore/gh-action-sigstore-python@v3.0.1
+        uses: sigstore/gh-action-sigstore-python@v3.5.0
         with:
           inputs: >-
             ./dist/*.tar.gz
@@ -61,10 +61,14 @@ jobs:
       - name: Upload artifact signatures to GitHub Release
         env:
           GITHUB_TOKEN: ${{ github.token }}
+        # --clobber: the Sigstore action above already attaches the signed
+        # dists to the release, so a plain upload errors with "asset already
+        # exists" and skips the PyPI publish below. Overwrite instead.
         run: >-
           gh release upload
           "${{ github.event.release.tag_name }}" ./dist/*
           --repo "$GITHUB_REPOSITORY"
+          --clobber
 
       - name: Remove Sigstore files
         run: rm -f dist/*.sig dist/*.crt dist/*.sigstore.json

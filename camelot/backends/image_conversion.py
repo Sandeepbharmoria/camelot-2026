@@ -1,17 +1,13 @@
 """Classes and functions for the ImageConversionBackend backends."""
 
 from typing import Any
-from typing import Dict
-from typing import List
-from typing import Type
 
 from .base import ConversionBackend
 from .ghostscript_backend import GhostscriptBackend
 from .pdfium_backend import PdfiumBackend
 from .poppler_backend import PopplerBackend
 
-
-BACKENDS: Dict[str, Type[ConversionBackend]] = {
+BACKENDS: dict[str, type[ConversionBackend]] = {
     "pdfium": PdfiumBackend,
     "ghostscript": GhostscriptBackend,
     "poppler": PopplerBackend,
@@ -42,7 +38,7 @@ class ImageConversionBackend:
         """
         self.backend: ConversionBackend = self.get_backend(backend)
         self.use_fallback: bool = use_fallback
-        self.fallbacks: List[str] = list(
+        self.fallbacks: list[str] = list(
             filter(lambda x: isinstance(backend, str) and x != backend, BACKENDS.keys())
         )
 
@@ -104,7 +100,7 @@ class ImageConversionBackend:
 
             return backend
 
-    def convert(self, pdf_path: str, png_path: str) -> None:
+    def convert(self, pdf_path: str, png_path: str, page: int = 1) -> None:
         """Convert PDF to png_path.
 
         Parameters
@@ -113,6 +109,8 @@ class ImageConversionBackend:
             Path where to read the pdf file.
         png_path : str
             Path where to save png file.
+        page: int, optional
+            Single page to convert.
 
         Raises
         ------
@@ -122,13 +120,13 @@ class ImageConversionBackend:
             [description]
         """
         try:
-            self.backend.convert(pdf_path, png_path)
+            self.backend.convert(pdf_path, png_path, page=page)
         except Exception as f:
             if self.use_fallback:
                 for fallback in self.fallbacks:
                     try:
                         converter = BACKENDS[fallback]()
-                        converter.convert(pdf_path, png_path)
+                        converter.convert(pdf_path, png_path, page=page)
                     except Exception as e:
                         msg = f"Image conversion failed with image conversion backend {fallback!r}\n error: {e}"
                         raise ImageConversionError(msg) from e
@@ -137,3 +135,30 @@ class ImageConversionBackend:
             else:
                 msg = f"Image conversion failed with image conversion backend {self.backend!r}\n error: {f}"
                 raise ImageConversionError(msg) from f
+
+    def to_array(self, pdf_path: str, page: int = 1):
+        """Render a page to an in-memory BGR ndarray, skipping the PNG file.
+
+        Uses the backend's native in-memory render (``to_array``) when it
+        has one — pdfium does, which avoids the PNG encode+decode that
+        ``convert`` + ``cv2.imread`` would otherwise pay. Backends that can
+        only write files (ghostscript/poppler) transparently fall back to
+        ``convert`` into a temp PNG and read it back, so behaviour is
+        identical, just without the speed-up.
+        """
+        if hasattr(self.backend, "to_array"):
+            try:
+                return self.backend.to_array(pdf_path, page=page)
+            except Exception as f:
+                if not self.use_fallback:
+                    msg = f"Image conversion failed with backend {self.backend!r}\n error: {f}"
+                    raise ImageConversionError(msg) from f
+        # Fallback: write a temp PNG (with convert's own fallback chain) and
+        # read it back. Local imports keep these off the hot import path.
+        import cv2
+
+        from ..utils import build_file_path_in_temp_dir
+
+        png_path = build_file_path_in_temp_dir("icb_to_array", ".png")
+        self.convert(pdf_path, png_path, page=page)
+        return cv2.imread(png_path)

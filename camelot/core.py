@@ -2,32 +2,37 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 import sqlite3
 import sys
 import tempfile
 import zipfile
+from collections.abc import Iterable
+from collections.abc import Iterator
 from operator import itemgetter
 from typing import Any
-from typing import Iterable
-from typing import Iterator
 
 import cv2
+import numpy as np
 import pandas as pd
-
 
 if sys.version_info >= (3, 11):
     from typing import TypedDict  # pylint: disable=no-name-in-module
     from typing import Unpack
 else:
-    from typing_extensions import TypedDict, Unpack
+    # 3.10 is the floor (requires-python = ">=3.10"); typing_extensions
+    # remains the source of TypedDict/Unpack on 3.10 because Unpack only
+    # entered typing in 3.11.
+    from typing_extensions import TypedDict
+    from typing_extensions import Unpack
 
 from .backends import ImageConversionBackend
+from .image_processing import undo_rotation
 from .utils import build_file_path_in_temp_dir
 from .utils import get_index_closest_point
 from .utils import get_textline_coords
-
 
 # minimum number of vertical textline intersections for a textedge
 # to be considered valid
@@ -140,9 +145,14 @@ class TextEdge(TextAlignment):
         if math.isclose(self.y0, textline.y0, abs_tol=edge_tol):
             self.register_aligned_textline(textline, x)
             self.y0 = textline.y0
-            # a textedge is valid only if it extends uninterrupted
-            # over a required number of textlines
-            if len(self.textlines) > TEXTEDGE_REQUIRED_ELEMENTS:
+            # A textedge is valid once it extends uninterrupted over the
+            # required number of textlines. The docstring (TextEdge.is_valid:
+            # "intersects with at least TEXTEDGE_REQUIRED_ELEMENTS rows") and
+            # the constant comment both say "minimum 4" — but the comparison
+            # was strict-greater, so an edge with exactly 4 textlines was
+            # still considered invalid and the surrounding table dropped.
+            # Reported as #342, originally patched in #345.
+            if len(self.textlines) >= TEXTEDGE_REQUIRED_ELEMENTS:
                 self.is_valid = True
 
 
@@ -548,6 +558,7 @@ class Table:
         self.filename = None
         self.order = None
         self.page = None
+        self.rotation = ""
         self.flavor = None  # Flavor of the parser that generated the table
         self.pdf_size = None  # Dimensions of the original PDF page
         self._bbox = None  # Bounding box in original document
@@ -556,6 +567,79 @@ class Table:
 
         self._image = None
         self._image_path = None  # Temporary file to hold an image of the pdf
+
+        # NumPy / Python-list mirrors of ``rows`` and ``cols`` used by the
+        # hot inner loop in :func:`camelot.utils.get_table_index`. Built
+        # lazily by :meth:`_build_search_caches` on first call so that
+        # constructing a ``Table`` that is never searched (e.g. in
+        # unit-test fixtures) pays nothing for these. All are private and
+        # the public list-of-tuples API (``table.rows[r][0]``) keeps
+        # working unchanged. See PERF in the perf report.
+        self._rows_np_cache = None
+        self._cols_np_cache = None
+        # Ascending ``-y_top`` Python list. ``bisect.bisect_left`` on a
+        # plain Python list is markedly faster than ``np.searchsorted``
+        # for the per-call (scalar) lookup at the table sizes Camelot
+        # typically deals with (tens of rows).
+        self._neg_y_tops_list = None
+        # Pre-computed column widths (``|x_left - x_right|``) as a Python
+        # list, used by the column-overlap loop in ``get_table_index``.
+        self._col_widths_list = None
+        # ``True`` once the row partition has been verified to be
+        # non-overlapping (``rows[i].y_bot >= rows[i+1].y_top``) — the
+        # invariant Camelot's parsers maintain. ``False`` until the cache
+        # has been built or when the rows really do overlap.
+        self._rows_disjoint = False
+
+    def _build_search_caches(self):
+        """Populate the search caches used by ``get_table_index``.
+
+        Idempotent: callers may invoke this every call (it short-circuits
+        on the first attribute that is already populated). The NumPy
+        arrays are part of the private interface and kept available so
+        future call sites can do their own bulk processing.
+        """
+        if self._rows_np_cache is None:
+            rows = self.rows
+            self._rows_np_cache = np.asarray(rows, dtype=np.float64).reshape(-1, 2)
+            # ``-y_top`` is ascending because ``rows`` is descending by
+            # ``y_top``; that's what ``bisect.bisect_left`` needs.
+            self._neg_y_tops_list = [-r[0] for r in rows]
+            # Are the rows non-overlapping? When they are (the only case
+            # produced by Camelot's parsers), ``get_table_index`` can use
+            # a constant-time row lookup; otherwise it falls back to the
+            # full linear scan to preserve bit-identical semantics with
+            # the previous Python-loop implementation.
+            self._rows_disjoint = all(
+                rows[i][1] >= rows[i + 1][0] for i in range(len(rows) - 1)
+            )
+        if self._cols_np_cache is None:
+            cols = self.cols
+            self._cols_np_cache = np.asarray(cols, dtype=np.float64).reshape(-1, 2)
+            self._col_widths_list = [abs(c[0] - c[1]) for c in cols]
+
+    @property
+    def _rows_np(self):
+        """Return rows as an ``(n_rows, 2)`` float64 NumPy array.
+
+        Lazily constructed on first access and cached. Each row is
+        ``(y_top, y_bot)`` and rows preserve their original descending
+        ``y_top`` order.
+        """
+        if self._rows_np_cache is None:
+            self._build_search_caches()
+        return self._rows_np_cache
+
+    @property
+    def _cols_np(self):
+        """Return cols as an ``(n_cols, 2)`` float64 NumPy array.
+
+        Lazily constructed on first access and cached. Each column is
+        ``(x_left, x_right)``.
+        """
+        if self._cols_np_cache is None:
+            self._build_search_caches()
+        return self._cols_np_cache
 
     def __repr__(self):
         """Return a string representation of the class .
@@ -595,20 +679,57 @@ class Table:
         return d
 
     @property
-    def parsing_report(self):
-        """Returns a parsing report.
+    def confidence(self) -> float:
+        """A unified per-table quality score in ``[0.0, 1.0]``.
 
-        with % accuracy, % whitespace,
-        table number on page and page number.
+        Computed from the existing per-flavor signals as
+        ``(accuracy / 100) * (1 - whitespace / 100)``. The intent is a
+        single number suitable for production filtering and automated
+        validation — ``confidence >= 0.8`` works as a reasonable
+        first-cut threshold; tune for the source PDFs.
+
+        Components and their meaning are identical across flavors:
+
+        - ``accuracy`` (0-100): how well the detected cells line up
+          with the parser's structural hints (line joints for lattice,
+          text alignments for stream/network/hybrid). Higher is better.
+        - ``whitespace`` (0-100): percentage of cells that are empty
+          after stripping. Lower is better (a perfectly populated
+          table is 0; a mostly-empty one trends toward 100).
+        - ``confidence`` (0-1): the composite. ``accuracy=90``,
+          ``whitespace=10`` → ``confidence≈0.81``; either signal
+          going to its worst value pulls ``confidence`` to 0.
+
+        See #659.
         """
-        # pretty?
-        report = {
+        return max(0.0, (self.accuracy / 100.0) * (1.0 - self.whitespace / 100.0))
+
+    @property
+    def parsing_report(self):
+        """Per-table parsing report.
+
+        Standard keys across all flavors:
+
+        =================  ==============================================
+        ``page``           1-based page number the table was found on.
+        ``order``          1-based rank within that page (left-to-right /
+                           top-to-bottom).
+        ``accuracy``       Float in ``[0, 100]``. See ``confidence`` for
+                           component-by-component definitions.
+        ``whitespace``     Float in ``[0, 100]``.
+        ``confidence``     Float in ``[0, 1]``. Unified quality score —
+                           combines accuracy and whitespace.
+        =================  ==============================================
+
+        See #659.
+        """
+        return {
             "accuracy": round(self.accuracy, 2),
             "whitespace": round(self.whitespace, 2),
             "order": self.order,
             "page": self.page,
+            "confidence": round(self.confidence, 4),
         }
-        return report
 
     def get_pdf_image(self):
         """Compute pdf image and cache it."""
@@ -618,8 +739,8 @@ class Table:
                     os.path.basename(self.filename), ".png"
                 )
                 backend = ImageConversionBackend(use_fallback=True)
-                backend.convert(self.filename, self._image_path)
-            self._image = cv2.imread(self._image_path)
+                backend.convert(self.filename, self._image_path, page=self.page)
+            self._image = undo_rotation(cv2.imread(self._image_path), self.rotation)
         return self._image
 
     def set_all_edges(self):
@@ -753,57 +874,71 @@ class Table:
         -------
         camelot.core.Table
             The updated table with copied text in spanning cells.
+
+        Notes
+        -----
+        Iterates the directional copy passes until the table is stable.
+        A single pass-per-direction misses cells spanned in *both*
+        directions (a 2D span): the source cell from which the
+        2D-spanned cell would copy hasn't itself been filled yet, so
+        the empty string propagates through. Repeating the chosen
+        passes until no cell changes converges in O(spans) iterations
+        and fixes the symptom reported in #349.
         """
         if copy_text is None:
             return self
 
-        for direction in copy_text:
-            if direction == "h":
-                self._copy_horizontal_text()
-            elif direction == "v":
-                self._copy_vertical_text()
+        passes = {"h": self._copy_horizontal_text, "v": self._copy_vertical_text}
+        # Cap to a sane upper bound — converges in O(spans) but the
+        # loop guards against a hypothetical pathological table.
+        for _ in range(max(len(self.cells), 1) * 2):
+            changed = False
+            for direction in copy_text:
+                pass_fn = passes.get(direction)
+                if pass_fn is not None and pass_fn():
+                    changed = True
+            if not changed:
+                break
 
         return self
 
     def _copy_horizontal_text(self):
-        """
-        Copies text horizontally in empty spanning cells.
+        """Copy text rightwards into empty horizontally-spanned cells.
 
-        This method iterates through the cells and fills empty cells that span
-        horizontally with the text from the left adjacent cell.
-
-        Returns
-        -------
-        None
+        Fills empty cells that span horizontally with the text from the
+        left adjacent cell. Returns ``True`` when at least one cell's
+        text was changed — used by :meth:`copy_spanning_text` to decide
+        whether another pass is needed.
         """
+        changed = False
         for i in range(len(self.cells)):
             for j in range(len(self.cells[i])):
-                if (
-                    self.cells[i][j].text.strip() == ""
-                    and self.cells[i][j].hspan
-                    and not self.cells[i][j].left
-                ):
-                    self.cells[i][j].text = self.cells[i][j - 1].text
+                cell = self.cells[i][j]
+                if cell.text.strip() == "" and cell.hspan and not cell.left:
+                    source = self.cells[i][j - 1].text
+                    if source != cell.text:
+                        cell.text = source
+                        changed = True
+        return changed
 
     def _copy_vertical_text(self):
-        """
-        Copies text vertically in empty spanning cells.
+        """Copy text downwards into empty vertically-spanned cells.
 
-        This method iterates through the cells and fills empty cells that span
-        vertically with the text from the top adjacent cell.
-
-        Returns
-        -------
-        None
+        Fills empty cells that span vertically with the text from the
+        top adjacent cell. Returns ``True`` when at least one cell's
+        text was changed — used by :meth:`copy_spanning_text` to decide
+        whether another pass is needed.
         """
+        changed = False
         for i in range(len(self.cells)):
             for j in range(len(self.cells[i])):
-                if (
-                    self.cells[i][j].text.strip() == ""
-                    and self.cells[i][j].vspan
-                    and not self.cells[i][j].top
-                ):
-                    self.cells[i][j].text = self.cells[i - 1][j].text
+                cell = self.cells[i][j]
+                if cell.text.strip() == "" and cell.vspan and not cell.top:
+                    source = self.cells[i - 1][j].text
+                    if source != cell.text:
+                        cell.text = source
+                        changed = True
+        return changed
 
     def to_csv(self, path, **kwargs):
         """Write Table(s) to a comma-separated values (csv) file.
@@ -823,65 +958,101 @@ class Table:
     def to_json(self, path, **kwargs):
         """Write Table(s) to a JSON file.
 
-        For kwargs, check :meth:`pandas.DataFrame.to_json`.
+        For kwargs, check :meth:`pandas.DataFrame.to_json`. The
+        optional ``mode`` kwarg (``"w"`` to overwrite, ``"a"`` to
+        append) is consumed by the file-open call; the rest are
+        forwarded to ``DataFrame.to_json`` (#317).
 
         Parameters
         ----------
         path : str
             Output filepath.
+        mode : str, optional (default: 'w')
+            File open mode. Pass ``"a"`` to append to an existing file
+            rather than overwrite it.
 
         """
+        mode = kwargs.pop("mode", "w")
         kw = {"orient": "records"}
         kw.update(kwargs)
         json_string = self.df.to_json(**kw)
-        with open(path, "w") as f:
+        with open(path, mode) as f:
             f.write(json_string)
 
     def to_excel(self, path, **kwargs):
         """Write Table(s) to an Excel file.
 
-        For kwargs, check :meth:`pandas.DataFrame.to_excel`.
+        For kwargs, check :meth:`pandas.DataFrame.to_excel`. The
+        optional ``mode`` kwarg is forwarded to
+        :class:`pandas.ExcelWriter` (``"w"`` to overwrite, ``"a"`` to
+        append a new sheet to an existing workbook) — see #317.
 
         Parameters
         ----------
         path : str
             Output filepath.
+        mode : str, optional (default: 'w')
+            ExcelWriter open mode. Use ``"a"`` to add a new sheet to
+            an existing workbook (requires openpyxl).
 
         """
-        kw = {"encoding": "utf-8"}
+        mode = kwargs.pop("mode", "w")
+        # Mirror to_csv defaults: suppress pandas' auto-generated integer
+        # row index and column header. Camelot's DataFrame uses positional
+        # indices (0, 1, 2, …) for rows and columns, which leak into the
+        # Excel output as a meaningless extra row and column. See #634.
+        # Users can override by passing index=True / header=True.
+        # NB: no "encoding" key — pandas >= 2 removed it from to_excel and
+        # passing it raises TypeError.
+        kw = {"index": False, "header": False}
         sheet_name = f"page-{self.page}-table-{self.order}"
         kw.update(kwargs)
-        writer = pd.ExcelWriter(path)
-        self.df.to_excel(writer, sheet_name=sheet_name, **kw)
+        # Context-manage the writer: a bare ExcelWriter that is never closed
+        # leaves the workbook unflushed (empty file) on pandas >= 2.
+        with pd.ExcelWriter(path, mode=mode) as writer:
+            self.df.to_excel(writer, sheet_name=sheet_name, **kw)
 
     def to_html(self, path, **kwargs):
         """Write Table(s) to an HTML file.
 
-        For kwargs, check :meth:`pandas.DataFrame.to_html`.
+        For kwargs, check :meth:`pandas.DataFrame.to_html`. The
+        optional ``mode`` kwarg is consumed by the file-open call
+        (#317).
 
         Parameters
         ----------
         path : str
             Output filepath.
+        mode : str, optional (default: 'w')
+            File open mode. Pass ``"a"`` to append to an existing file
+            rather than overwrite it.
 
         """
+        mode = kwargs.pop("mode", "w")
         html_string = self.df.to_html(**kwargs)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, mode, encoding="utf-8") as f:
             f.write(html_string)
 
     def to_markdown(self, path, **kwargs):
         """Write Table(s) to a Markdown file.
 
-        For kwargs, check :meth:`pandas.DataFrame.to_markdown`.
+        For kwargs, check :meth:`pandas.DataFrame.to_markdown`. The
+        optional ``mode`` kwarg is consumed by the file-open call —
+        passing ``mode="a"`` appends every successive call to the
+        same file rather than overwriting (#317).
 
         Parameters
         ----------
         path : str
             Output filepath.
+        mode : str, optional (default: 'w')
+            File open mode. Pass ``"a"`` to append to an existing file
+            rather than overwrite it.
 
         """
+        mode = kwargs.pop("mode", "w")
         md_string = self.df.to_markdown(**kwargs)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, mode, encoding="utf-8") as f:
             f.write(md_string)
 
     def to_sqlite(self, path, **kwargs):
@@ -904,6 +1075,95 @@ class Table:
         conn.close()
 
 
+def _vstack_run(run: list[Table], drop_repeated_header: bool = False) -> Table:
+    """Vertically concatenate a run of contiguous Tables (#628 POC).
+
+    All tables in ``run`` must share the same column count — the caller
+    (:meth:`TableList.stack_contiguous`) is responsible for that
+    invariant. A single-element run is returned via a deep copy so the
+    output never aliases the input.
+
+    Geometry:
+        * The first table's ``rows`` / ``cells`` / ``_bbox`` stay in
+          place. Each subsequent table's y-coordinates are shifted so
+          its top sits at the previous table's bottom — the stacked
+          result reads as one tall page even though source pages
+          differ.
+
+    ``parsing_report`` is mean-aggregated across the run (accuracy,
+    whitespace, confidence are averaged); ``page`` and ``order`` are
+    taken from the first table.
+    """
+    if len(run) == 1:
+        return copy.deepcopy(run[0])
+
+    out = copy.deepcopy(run[0])
+    out_dfs = [out.df]
+
+    for nxt in run[1:]:
+        nxt_copy = copy.deepcopy(nxt)
+        # Shift the upcoming table's geometry so its top sits at the
+        # current bottom of `out`. PDF coords: y0 = bottom, y1 = top
+        # within each table (rows are stored as (top_y, bottom_y) tuples
+        # within Table.rows; bbox is (x0, y0, x1, y1)).
+        #
+        # Geometry shifting needs both tables to carry a _bbox. Parser-
+        # built Tables always do; if either is missing one (a Table
+        # constructed without going through a parser), skip the geometry
+        # merge and just concatenate the DataFrames — the df is what
+        # callers of stack_contiguous overwhelmingly want, and a missing
+        # bbox means there's no meaningful page geometry to stitch.
+        if out._bbox is not None and nxt_copy._bbox is not None:
+            out_bottom = out._bbox[1]
+            nxt_top = nxt_copy._bbox[3]
+            dy = out_bottom - nxt_top
+            nxt_copy.rows = [(r0 + dy, r1 + dy) for (r0, r1) in nxt_copy.rows]
+            for row in nxt_copy.cells:
+                for cell in row:
+                    cell.y1 += dy
+                    cell.y2 += dy
+                    # lb/lt/rb/rt are snapshot tuples set in Cell.__init__;
+                    # rebuild them so plotting and any other downstream
+                    # geometry consumer sees the shifted coords.
+                    cell.lb = (cell.x1, cell.y1)
+                    cell.lt = (cell.x1, cell.y2)
+                    cell.rb = (cell.x2, cell.y1)
+                    cell.rt = (cell.x2, cell.y2)
+            nxt_copy._bbox = (
+                nxt_copy._bbox[0],
+                nxt_copy._bbox[1] + dy,
+                nxt_copy._bbox[2],
+                nxt_copy._bbox[3] + dy,
+            )
+            out.rows = out.rows + nxt_copy.rows
+            out.cells = out.cells + nxt_copy.cells
+            out._bbox = (
+                min(out._bbox[0], nxt_copy._bbox[0]),
+                nxt_copy._bbox[1],  # new bottom
+                max(out._bbox[2], nxt_copy._bbox[2]),
+                out._bbox[3],  # original top
+            )
+
+        nxt_df = nxt_copy.df
+        if drop_repeated_header and not nxt_df.empty:
+            nxt_df = nxt_df.iloc[1:].reset_index(drop=True)
+        out_dfs.append(nxt_df)
+
+    out.df = pd.concat(out_dfs, ignore_index=True)
+
+    # Average per-table quality metrics across the run. `confidence` is a
+    # read-only @property derived from accuracy + whitespace (#659/#739),
+    # so it doesn't need explicit assignment — recomputes on next access.
+    accs = [t.accuracy for t in run if getattr(t, "accuracy", None) is not None]
+    wss = [t.whitespace for t in run if getattr(t, "whitespace", None) is not None]
+    if accs:
+        out.accuracy = sum(accs) / len(accs)
+    if wss:
+        out.whitespace = sum(wss) / len(wss)
+
+    return out
+
+
 class _Kw(TypedDict):
     """Helper class to define file related arguments."""
 
@@ -923,10 +1183,22 @@ class TableList:
     n : int
         Number of tables in the list.
 
+    Examples
+    --------
+    >>> from camelot.core import TableList
+    >>> tables = TableList([])
+    >>> tables.n
+    0
+    >>> tables
+    <TableList n=0>
+
     """
 
     def __init__(self, tables: Iterable[Table]) -> None:  # noqa D105
-        self._tables: Iterable[Table] = tables
+        # Materialise the iterable so __len__, __bool__, and __getitem__ work
+        # for any Iterable[Table] input (e.g. a generator), not just Sized
+        # containers. See #655.
+        self._tables: list[Table] = list(tables)
 
     def __repr__(self):  # noqa D105
         return f"<{self.__class__.__name__} n={self.n}>"
@@ -934,8 +1206,11 @@ class TableList:
     def __len__(self):  # noqa D105
         return len(self._tables)
 
-    def __getitem__(self, idx):  # noqa D105
-        return self._tables[idx]
+    def __getitem__(self, idx: int) -> Table:  # noqa D105
+        # _tables is currently typed as Iterable[Table]; #710 materialises it
+        # to list[Table] which will let this index without the ignore. Until
+        # that lands, silence mypy's (correct) complaint here.
+        return self._tables[idx]  # type: ignore[index]
 
     def __iter__(self) -> Iterator[Table]:  # noqa D105
         return iter(self._tables)
@@ -951,6 +1226,160 @@ class TableList:
     def n(self) -> int:
         """The number of tables in the list."""
         return len(self)
+
+    def filter(
+        self,
+        min_rows: int = 1,
+        min_columns: int = 1,
+        min_accuracy: float = 0.0,
+        max_whitespace: float = 100.0,
+    ) -> TableList:
+        """Return a new TableList keeping only tables that pass all thresholds.
+
+        A post-extraction convenience for dropping noise / low-quality
+        tables (single stray cells, mostly-empty regions, …). Parsing is
+        unchanged — everything is still detected; this just selects from
+        the result. Every threshold defaults to a no-op, so calling
+        ``filter()`` with no arguments returns an equivalent list and a
+        legitimate single-row or single-column table is never dropped
+        unless you ask for it.
+
+        Parameters
+        ----------
+        min_rows : int, optional (default: 1)
+            Drop tables with fewer than this many rows.
+        min_columns : int, optional (default: 1)
+            Drop tables with fewer than this many columns.
+        min_accuracy : float, optional (default: 0.0)
+            Drop tables whose ``parsing_report`` accuracy (0-100) is below
+            this value.
+        max_whitespace : float, optional (default: 100.0)
+            Drop tables whose ``parsing_report`` whitespace (0-100) is
+            above this value.
+
+        Returns
+        -------
+        camelot.core.TableList
+            A new list (the original is left untouched), so calls compose:
+            ``tables.filter(min_rows=2).filter(min_accuracy=90)``.
+
+        """
+        kept = [
+            table
+            for table in self._tables
+            if table.shape[0] >= min_rows
+            and table.shape[1] >= min_columns
+            and table.accuracy >= min_accuracy
+            and table.whitespace <= max_whitespace
+        ]
+        return TableList(kept)
+
+    def stack_contiguous(
+        self,
+        match: str = "column_count",
+        keep_first_header: bool = False,
+    ) -> TableList:
+        """Vertically stack tables that look like continuations across pages.
+
+        Many PDF reports break a single logical table over several pages
+        — a header on every page, a footer on every page, body rows in
+        between. ``read_pdf`` returns one :class:`Table` per page; this
+        helper stitches contiguous ones back together so the resulting
+        :class:`TableList` has one entry per *logical* table instead of
+        one per *physical* page.
+
+        Parameters
+        ----------
+        match : str, optional (default: 'column_count')
+            How to decide whether two adjacent tables are continuations
+            of each other.
+
+            * ``'column_count'`` — same number of columns (the rule from
+              #628's POC; the common case).
+            * ``'first_row'`` — same column count *and* identical text
+              in the first row (catches PDFs that repeat the header on
+              every page).
+        keep_first_header : bool, optional (default: False)
+            When ``match='first_row'``, the matching first row of every
+            continuation table is dropped (so the stacked table has
+            exactly one header row). Set to ``True`` to keep every
+            page's header row in the stacked output.
+
+        Returns
+        -------
+        camelot.core.TableList
+            A new TableList with continuation runs collapsed. Tables
+            that don't continue from the previous one (different
+            column count or different first row, depending on ``match``)
+            are passed through unchanged. The originals in ``self`` are
+            not mutated.
+
+        Notes
+        -----
+        Originally proposed by @TimothyOfDelphi in #628. Consolidates
+        #8 / #133 / #357 / #531.
+
+        Limitations:
+
+        * The stacked :class:`Table`'s ``page`` keeps the *first*
+          stitched table's page number; ``order`` keeps the first
+          table's order. Callers iterating with both shouldn't be
+          surprised by a missing row-of-pages.
+        * ``parsing_report`` is averaged: ``accuracy`` and
+          ``whitespace`` are mean-aggregated across the stitched
+          tables; ``confidence`` is recomputed from the averaged
+          accuracy + whitespace.
+        * Cell geometry (``_bbox``, ``cells``, ``rows``) is preserved
+          via the y-shift trick from #628's POC, so downstream
+          plotting on a single stitched table still works
+          page-locally. Cells from the second-and-later tables are
+          shifted to sit below the first table's bottom.
+        """
+        if match not in ("column_count", "first_row"):
+            raise ValueError(
+                f"match must be 'column_count' or 'first_row', got {match!r}"
+            )
+        if not self._tables:
+            return TableList([])
+
+        stitched: list[Table] = []
+        run: list[Table] = []
+
+        for table in self._tables:
+            if not run:
+                run.append(table)
+                continue
+            head = run[-1]
+            same_cols = len(head.cols) == len(table.cols)
+            same_header = same_cols and (
+                match != "first_row"
+                or (
+                    list(head.df.iloc[0]) == list(table.df.iloc[0])
+                    if not head.df.empty and not table.df.empty
+                    else False
+                )
+            )
+            if same_cols and (match == "column_count" or same_header):
+                run.append(table)
+            else:
+                stitched.append(
+                    _vstack_run(
+                        run,
+                        drop_repeated_header=(match == "first_row")
+                        and not keep_first_header,
+                    )
+                )
+                run = [table]
+        if run:
+            stitched.append(
+                _vstack_run(
+                    run,
+                    drop_repeated_header=(match == "first_row")
+                    and not keep_first_header,
+                )
+            )
+
+        return TableList(stitched)
 
     def _write_file(self, f=None, **kwargs: Unpack[_Kw]) -> None:
         dirname = kwargs["dirname"]

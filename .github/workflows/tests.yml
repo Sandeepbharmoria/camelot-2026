@@ -6,32 +6,94 @@ on:
   pull_request:
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      test_matrix: ${{ steps.matrix.outputs.include }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          predicate-quantifier: every
+          filters: |
+            code:
+              - "**"
+              - "!docs/**"
+              - "!*.md"
+              - "!*.rst"
+
+      - name: Select Nox matrix
+        id: matrix
+        shell: python
+        run: |
+          import json
+          import os
+
+          checks = [
+              {"python": "3.10", "os": "ubuntu-latest", "session": "pre-commit"},
+              {"python": "3.10", "os": "ubuntu-latest", "session": "safety"},
+              {
+                  "python": "3.11",
+                  "os": "ubuntu-latest",
+                  "session": "mypy",
+                  "posargs": [
+                      "camelot",
+                      "tests",
+                      "docs/conf.py",
+                      "--allow-untyped-globals",
+                  ],
+              },
+          ]
+          test_sessions = [
+              {"python": "3.12", "os": "ubuntu-latest", "session": "tests"},
+              {"python": "3.11", "os": "ubuntu-latest", "session": "tests"},
+              {"python": "3.10", "os": "ubuntu-latest", "session": "tests"},
+              {"python": "3.13", "os": "ubuntu-latest", "session": "tests"},
+              {"python": "3.14", "os": "ubuntu-latest", "session": "tests"},
+              {
+                  "python": "3.15",
+                  "os": "ubuntu-latest",
+                  "session": "tests",
+                  "experimental": True,
+              },
+              {"python": "3.10", "os": "windows-latest", "session": "tests"},
+              {"python": "3.10", "os": "macos-latest", "session": "tests"},
+              {"python": "3.10", "os": "ubuntu-latest", "session": "typeguard"},
+              {"python": "3.10", "os": "ubuntu-latest", "session": "xdoctest"},
+          ]
+          docs_build = [
+              {"python": "3.13", "os": "ubuntu-latest", "session": "docs-build"},
+          ]
+
+          matrix = checks
+          if "${{ steps.filter.outputs.code }}" == "true":
+              matrix += test_sessions
+          matrix += docs_build
+
+          with open(os.environ["GITHUB_OUTPUT"], mode="a") as output:
+              print(f"include={json.dumps(matrix)}", file=output)
+
   tests:
     name: ${{ matrix.session }} ${{ matrix.python }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    needs: changes
+    # Allow the experimental (pre-release) Python entries to fail without
+    # failing the workflow as a whole. This job-level flag keeps a failing
+    # 3.15 row from failing the run, but GitHub still reports the individual
+    # matrix job as red; the step-level flag on "Run Nox" below is what turns
+    # the reported check green.
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { python: "3.10", os: "ubuntu-latest", session: "pre-commit" }
-          - { python: "3.10", os: "ubuntu-latest", session: "safety" }
-          - {
-              python: "3.11",
-              os: "ubuntu-latest",
-              session: "mypy",
-              posargs:
-                ["camelot", "tests", "docs/conf.py", "--allow-untyped-globals"],
-            }
-          - { python: "3.12", os: "ubuntu-latest", session: "tests" }
-          - { python: "3.11", os: "ubuntu-latest", session: "tests" }
-          - { python: "3.10", os: "ubuntu-latest", session: "tests" }
-          - { python: "3.8", os: "ubuntu-latest", session: "tests" }
-          - { python: "3.9", os: "ubuntu-latest", session: "tests" }
-          - { python: "3.10", os: "windows-latest", session: "tests" }
-          - { python: "3.10", os: "macos-latest", session: "tests" }
-          - { python: "3.10", os: "ubuntu-latest", session: "typeguard" }
-          - { python: "3.10", os: "ubuntu-latest", session: "xdoctest" }
-          - { python: "3.13", os: "ubuntu-latest", session: "docs-build" }
+        include: ${{ fromJSON(needs.changes.outputs.test_matrix) }}
 
     env:
       NOXSESSION: ${{ matrix.session }}
@@ -40,16 +102,23 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
+          # Needed for the 3.15 experimental entry (pre-release); harmless for stable.
+          allow-prereleases: true
 
       - name: Upgrade pip
+        # constraints.txt pins pip==26.x, which relies on
+        # `typing.no_type_check_decorator` that Python 3.15 removed.
+        # Skip the explicit upgrade on the 3.15 row and rely on the pip
+        # shipped by setup-python.
+        if: matrix.python != '3.15'
         run: |
-          pip install --constraint=${PWD}/.github/workflows/constraints.txt pip
+          pip install --constraint="${PWD}/.github/workflows/constraints.txt" pip
           pip --version
 
       - name: Upgrade pip in virtual environments
@@ -62,18 +131,22 @@ jobs:
               print(f"VIRTUALENV_PIP={pip.__version__}", file=io)
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
 
       - name: Install Nox
         run: |
-          pipx install --pip-args=--constraint=${PWD}/.github/workflows/constraints.txt nox
+          pipx install --pip-args=--constraint="${PWD}/.github/workflows/constraints.txt" nox
           nox --version
 
       - name: Install ghostscript
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt update
-          sudo apt install ghostscript
+          # libjpeg-dev + zlib1g-dev are needed when uv builds Pillow from
+          # source on the Python 3.15 row (no Pillow wheel ships for 3.15
+          # pre-releases yet). They're harmless / idempotent on the other
+          # Python rows where Pillow installs from a wheel directly.
+          sudo apt install -y ghostscript libjpeg-dev zlib1g-dev
 
       - name: Install ghostscript (macos-latest)
         if: matrix.os == 'macos-latest'
@@ -93,6 +166,7 @@ jobs:
         shell: python
         run: |
           import hashlib
+          import os
           import sys
 
           python = "py{}.{}".format(*sys.version_info[:2])
@@ -100,10 +174,11 @@ jobs:
           digest = hashlib.sha256(payload).hexdigest()
           result = "${{ runner.os }}-{}-{}-pre-commit".format(python, digest[:8])
 
-          print("::set-output name=result::{}".format(result))
+          with open(os.environ["GITHUB_OUTPUT"], mode="a") as output:
+              print("result={}".format(result), file=output)
 
       - name: Restore pre-commit cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         if: matrix.session == 'pre-commit'
         with:
           path: ~/.cache/pre-commit
@@ -112,12 +187,20 @@ jobs:
             ${{ steps.pre-commit-cache.outputs.result }}-
 
       - name: Run Nox
+        # Tolerate failures on the pre-release (experimental) Python rows at
+        # the *step* level so the job's check reports green. A core dependency
+        # such as pandas frequently has no wheel for a new pre-release yet and
+        # cannot be built from source (e.g. pandas' meson build errors with
+        # "Unknown compiler(s): cython" on 3.15), which would otherwise mark
+        # every PR's "tests 3.15" check red. The row still runs to give early
+        # signal and will pass on its own once upstream wheels land.
+        continue-on-error: ${{ matrix.experimental || false }}
         run: |
           nox --python=${{ matrix.python }}
 
       - name: Upload coverage data
         if: always() && matrix.session == 'tests'
-        uses: "actions/upload-artifact@v4"
+        uses: "actions/upload-artifact@v7"
         with:
           name: coverage-data-${{ matrix.session }}-${{ matrix.python }}-${{ matrix.os }}
           path: ".coverage.*"
@@ -126,38 +209,39 @@ jobs:
 
       - name: Upload documentation
         if: matrix.session == 'docs-build'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docs
           path: docs/_build
 
   coverage:
     runs-on: ubuntu-latest
-    needs: tests
+    needs: [changes, tests]
+    if: needs.changes.outputs.code == 'true'
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.10"
 
       - name: Upgrade pip
         run: |
-          pip install --constraint=${PWD}/.github/workflows/constraints.txt pip
+          pip install --constraint="${PWD}/.github/workflows/constraints.txt" pip
           pip --version
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v7
 
       - name: Install Nox
         run: |
-          pipx install --pip-args=--constraint=${PWD}/.github/workflows/constraints.txt nox
+          pipx install --pip-args=--constraint="${PWD}/.github/workflows/constraints.txt" nox
           nox --version
 
       - name: Download coverage data
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: coverage-data-*
           merge-multiple: true
@@ -171,7 +255,7 @@ jobs:
           nox --session=coverage -- xml -i
 
       - name: Upload coverage report
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
           file: ./coverage.xml

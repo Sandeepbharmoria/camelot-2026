@@ -16,7 +16,7 @@ The following quote sums up the **Code Of Conduct**.
 
 Kenneth Reitz has also written an `essay`_ on this topic, which you should read.
 
-.. _essay: https://kennethreitz.org/essays/2013/01/27/be-cordial-or-be-on-your-way
+.. _essay: https://kennethreitz.org/essays/2013-01-be_cordial_or_be_on_your_way
 
 As the `Requests Code Of Conduct`_ states, **all contributions are welcome**, as long as everyone involved is treated with respect.
 
@@ -120,6 +120,8 @@ Writing Documentation
 Writing documentation, function docstrings, examples and tutorials is a great way to start contributing to open-source software! The documentation is present inside the ``docs/`` directory of the source code repository.
 
 The documentation is written in `reStructuredText`_, with `Sphinx`_ used to generate these lovely HTML files that you're currently reading (unless you're reading this on GitHub). You can edit the documentation using any text editor and then generate the HTML output by running `make html` in the ``docs/`` directory.
+
+Docs-only pull requests still run linting and the documentation build in CI, but skip the full Python/OS test matrix.
 
 The function docstrings are written using the `numpydoc`_ extension for Sphinx. Make sure you check out how its format guidelines before you start writing one.
 
